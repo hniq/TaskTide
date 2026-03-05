@@ -414,7 +414,7 @@ function renderWeek() {
           return `<div class="week-task ${getQClass(x.task.eisenhowerQuadrant)}${isCompleted}" draggable="true" data-sid="${x.sub.id}" data-tid="${x.task.id}">
           <div class="week-task-title">${esc(x.sub.title)}</div>
           <div class="week-task-parent">${esc(x.task.title)}</div>
-          <div class="week-task-hours">${x.sub.estimatedHours}h <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
+          <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
         </div>`;
         }).join('') : '<div class="week-empty">无任务</div>'}
       </div>
@@ -650,6 +650,192 @@ function toggleSidebarCompleted() {
   arrow.classList.toggle('open');
 }
 
+// ======== Chunk (切块) & Format Utilities ========
+
+/** 将小时数舍入到 0.25 粒度，最小 0.25 */
+function roundToQuarter(hours) {
+  const v = Math.round(hours / 0.25) * 0.25;
+  return Math.max(0.25, v);
+}
+
+/** 格式化时长显示：>=1h 显示 Xh，<1h 显示 XX分钟 */
+function formatDuration(hours) {
+  const h = Number(hours);
+  if (isNaN(h) || h <= 0) return '';
+  if (h >= 1) {
+    return Number.isInteger(h) ? `${h}h` : `${parseFloat(h.toFixed(1))}h`;
+  }
+  return `${Math.round(h * 60)}分钟`;
+}
+
+/** 去掉标题中已有的 session 后缀，如 " (2/3)" 或 " 2/3" */
+function stripSessionSuffix(title) {
+  return title.replace(/\s*\(?\d+\/\d+\)?\s*$/, '').trim();
+}
+
+/** 根据标题关键词生成 miniStart 提示（纯规则，不调 AI） */
+function genMiniStart(title) {
+  if (/代码|开发|实现|修复|bug|编程|编码/i.test(title)) {
+    return '打开项目跑起来，定位到相关文件，先改一个最小点';
+  }
+  if (/阅读|文献|学习|读/.test(title)) {
+    return '打开材料，先扫读目录并写3个问题';
+  }
+  if (/写|撰写|文档|报告|总结/.test(title)) {
+    return '打开文档，先写5行大纲或列5个要点';
+  }
+  return '打开相关材料，写下3条要点，然后开始计时';
+}
+
+/**
+ * 对"当前这一条 subtask"做一次切块，返回 minutes 数组。
+ * 递归友好：根据当前 totalMin 决定如何拆分。
+ */
+function splitOnce(totalMin) {
+  // 太小不切
+  if (totalMin < 20) return null;
+
+  // >= 90：拆出一个 90，remainder 按 45/25 继续
+  if (totalMin >= 90) {
+    if (totalMin === 90) {
+      // 对 90min 再切 → [45, 45]
+      return [45, 45];
+    }
+    const chunks = [90];
+    let rem = totalMin - 90;
+    while (rem >= 45) { chunks.push(45); rem -= 45; }
+    while (rem >= 25) { chunks.push(25); rem -= 25; }
+    if (rem > 0) {
+      if (rem < 10 && chunks.length > 0) {
+        chunks[chunks.length - 1] += rem;
+      } else {
+        chunks.push(rem);
+      }
+    }
+    return chunks.length > 1 ? chunks : null;
+  }
+
+  // 45-89min 区间
+  if (totalMin >= 45) {
+    if (totalMin === 45) {
+      // 对 45min 再切 → [25, 20]
+      return [25, 20];
+    }
+    const chunks = [45];
+    let rem = totalMin - 45;
+    while (rem >= 25) { chunks.push(25); rem -= 25; }
+    if (rem > 0) {
+      if (rem < 10 && chunks.length > 0) {
+        chunks[chunks.length - 1] += rem;
+      } else {
+        chunks.push(rem);
+      }
+    }
+    return chunks.length > 1 ? chunks : null;
+  }
+
+  // 25-44min 区间
+  if (totalMin >= 25) {
+    if (totalMin === 25) {
+      // 对 25min 再切 → [15, 10]
+      return [15, 10];
+    }
+    const first = Math.min(25, totalMin);
+    const rem = totalMin - first;
+    if (rem >= 10) {
+      return [first, rem];
+    }
+    if (rem > 0 && rem < 10) {
+      return [first + rem]; // 合并，等于没拆
+    }
+    return null;
+  }
+
+  // 20-24min
+  if (totalMin >= 20) {
+    return [10, totalMin - 10];
+  }
+
+  return null;
+}
+
+/** 替换 assignedDays 中旧子任务 id 为新子任务 ids */
+function replaceAssignmentIds(task, oldSid, oldHours, newSubs) {
+  if (!task.assignedDays) return;
+  const newSids = newSubs.map(s => s.id);
+  const newTotalHours = newSubs.reduce((s, x) => s + x.estimatedHours, 0);
+
+  Object.keys(task.assignedDays).forEach(date => {
+    let dayData = task.assignedDays[date];
+
+    // 兼容 number 旧格式
+    if (typeof dayData === 'number') {
+      task.assignedDays[date] = { subtaskIds: ['__whole_' + task.id], hours: dayData };
+      dayData = task.assignedDays[date];
+    }
+
+    if (!dayData.subtaskIds) return;
+    const idx = dayData.subtaskIds.indexOf(oldSid);
+    if (idx === -1) return;
+
+    dayData.subtaskIds.splice(idx, 1, ...newSids);
+    dayData.hours = Math.max(0, (dayData.hours || 0) - oldHours + newTotalHours);
+
+    if (dayData.subtaskIds.length === 0 || dayData.hours <= 0) {
+      delete task.assignedDays[date];
+    }
+  });
+}
+
+/** 将指定子任务切块为多个 session（递归友好：每次只切一层） */
+function chunkSubtaskIntoSessions(taskId, subId) {
+  const task = tasks.find(t => t.id === taskId);
+  if (!task) return;
+  const subIdx = task.subtasks.findIndex(s => s.id === subId);
+  if (subIdx === -1) return;
+  const oldSub = task.subtasks[subIdx];
+  const oldHours = oldSub.estimatedHours || 0;
+
+  const totalMin = Math.round(oldHours * 60);
+  if (totalMin < 20) {
+    toast('已是最小块，无法继续切分');
+    return;
+  }
+
+  const chunks = splitOnce(totalMin);
+  if (!chunks || chunks.length <= 1) {
+    toast('已是最小块，无法继续切分');
+    return;
+  }
+
+  const n = chunks.length;
+  const baseTitle = stripSessionSuffix(oldSub.title);
+  const miniStart = genMiniStart(baseTitle);
+
+  const newSubs = chunks.map((chunkMin, i) => ({
+    id: uid(),
+    title: `${baseTitle} (${i + 1}/${n})`,
+    estimatedHours: parseFloat((chunkMin / 60).toFixed(4)),
+    completed: false,
+    order: 0,
+    miniStart: miniStart,
+    actualMin: null,
+    actualHours: null,
+    ...(oldSub._manuallyAssigned ? { _manuallyAssigned: true } : {}),
+    ...(oldSub._assignedDate ? { _assignedDate: oldSub._assignedDate } : {})
+  }));
+
+  replaceAssignmentIds(task, subId, oldHours, newSubs);
+  task.subtasks.splice(subIdx, 1, ...newSubs);
+  task.subtasks.forEach((s, i) => { s.order = i; });
+  task.estimatedHours = task.subtasks.reduce((s, x) => s + (x.estimatedHours || 0), 0);
+
+  saveTasks(tasks);
+  renderAll();
+  if (selectedTaskId === taskId) showTaskDetail(taskId);
+  toast(`已切块为 ${n} 个 session`);
+}
+
 // ======== Task Selection & Detail (Inline Editing) ========
 function selectTask(id) {
   selectedTaskId = id;
@@ -721,8 +907,13 @@ function showTaskDetail(id) {
         ${t.subtasks.map((s, i) => `<li class="sub-item${s.completed ? ' done' : ''}" data-sid="${s.id}" draggable="true">
           <span class="sub-handle">&#8942;&#8942;</span>
           <input type="checkbox" class="sub-check" data-tid="${t.id}" data-sid="${s.id}"${s.completed ? ' checked' : ''}>
-          <span class="sub-title">${esc(s.title)}</span>
-          <span class="sub-hours">${s.estimatedHours}h</span>
+          <div class="sub-content">
+            <span class="sub-title">${esc(s.title)}</span>
+            ${s.miniStart ? `<span class="sub-mini">${esc(s.miniStart)}</span>` : ''}
+          </div>
+          <span class="sub-hours">${formatDuration(s.estimatedHours)}</span>
+          ${s.actualMin != null ? `<span class="sub-actual">实际${s.actualMin}m</span>` : ''}
+          ${(s.estimatedHours >= 0.5 && !s.completed) ? `<button class="sub-chunk-btn" data-tid="${t.id}" data-sid="${s.id}">切块</button>` : ''}
           <span class="sub-rm" data-tid="${t.id}" data-sid="${s.id}">&#10005;</span>
         </li>`).join('')}
       </ul>
@@ -833,6 +1024,11 @@ function showTaskDetail(id) {
   // 子任务删除
   document.querySelectorAll('.sub-rm').forEach(btn => {
     btn.onclick = (e) => { e.stopPropagation(); removeSubtask(btn.dataset.tid, btn.dataset.sid); };
+  });
+  
+  // 子任务切块按钮
+  document.querySelectorAll('.sub-chunk-btn').forEach(btn => {
+    btn.onclick = (e) => { e.stopPropagation(); chunkSubtaskIntoSessions(btn.dataset.tid, btn.dataset.sid); };
   });
   
   // 子任务拖动排序
