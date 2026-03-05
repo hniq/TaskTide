@@ -2,6 +2,11 @@
    不咕了 - NoProcrastination  |  Main JavaScript
    v2.1 - 修复版：删除重复模块/修复按钮/优化自动分配/AI预览确认
    ================================================================ */
+/* 2026.03.05 17:13
+新增功能:
+easy task1: 统计耗时
+*/
+
 
 import { 
   uid, fmtDate, esc, dlText, calcQuadrant, calcPriority, 
@@ -49,7 +54,12 @@ function migrateTasks() {
     if (!t.eisenhowerQuadrant) { t.eisenhowerQuadrant = calcQuadrant(t); changed = true; }
     if (t.createdBy === undefined) { t.createdBy = 'manual'; changed = true; }
     if (!t.subtasks) t.subtasks = [];
-    t.subtasks.forEach((s, i) => { if (s.order === undefined) { s.order = i; changed = true; } });
+    t.subtasks.forEach((s, i) => {
+      if (s.order === undefined) { s.order = i; changed = true; }
+      if (s.actualMin === undefined)  { s.actualMin = null; changed = true; }
+      if (s.actualHours === undefined){ s.actualHours = null; changed = true; }
+      if (s.miniStart === undefined)  { s.miniStart = ""; changed = true; }
+    });
     if (!t.assignedDays) t.assignedDays = {};
     if (t.manualOrder === undefined) { t.manualOrder = 0; changed = true; }
   });
@@ -1130,15 +1140,56 @@ function restoreTask(id) {
 }
 
 // ======== Subtasks ========
+// function toggleSubtask(tid, sid, completed) {
+//   const t = tasks.find(x => x.id === tid);
+//   const s = t.subtasks.find(x => x.id === sid);
+//   if (s) {
+//     s.completed = completed;
+
+//     // 完成时若尚未记录实际耗时，弹窗询问
+//     if (completed && s.actualMin == null) {
+//       const raw = prompt('实际花费分钟数（可空跳过）');
+//       if (raw !== null && raw.trim() !== '') {
+//         const minutes = parseFloat(raw);
+//         if (!isNaN(minutes) && minutes >= 0) {
+//           s.actualMin   = minutes;
+//           s.actualHours = Math.round(minutes / 60 * 10) / 10; // 保留 1 位小数
+//         }
+//       }
+//     }
+
+//     saveTasks(tasks);
+//     renderAll();
+//     if (selectedTaskId === tid) showTaskDetail(tid);
+//   }
+// }
 function toggleSubtask(tid, sid, completed) {
   const t = tasks.find(x => x.id === tid);
+  if (!t || !Array.isArray(t.subtasks)) return;
+
   const s = t.subtasks.find(x => x.id === sid);
-  if (s) {
-    s.completed = completed;
-    saveTasks(tasks);
-    renderAll();
-    if (selectedTaskId === tid) showTaskDetail(tid);
+  if (!s) return;
+
+  s.completed = completed;
+
+  // 完成时若尚未记录实际耗时，弹窗询问
+  if (completed === true && (s.actualMin === null || s.actualMin === undefined)) {
+    const raw = prompt('实际花费分钟数（可空跳过）');
+    if (raw !== null) {
+      const txt = String(raw).trim();
+      if (txt !== '') {
+        const minutes = parseFloat(txt);
+        if (!Number.isNaN(minutes) && minutes >= 0) {
+          s.actualMin = minutes;
+          s.actualHours = Math.round((minutes / 60) * 10) / 10; // 1 位小数
+        }
+      }
+    }
   }
+
+  saveTasks(tasks);
+  renderAll();
+  if (selectedTaskId === tid) showTaskDetail(tid);
 }
 
 function removeSubtask(tid, sid) {
