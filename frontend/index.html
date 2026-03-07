@@ -22,7 +22,8 @@
     <div class="ai-preview" id="aiPreview"></div>
   </div>
   <div class="header-actions">
-    <button class="hdr-btn" id="settingsBtn">设置</button>
+    <button class="hdr-btn today-btn" id="todayBtn" title="今日专注">&#127774; 今日</button>
+    <button class="hdr-btn settings-btn" id="settingsBtn" title="设置">&#9881; 设置</button>
   </div>
 </header>
 
@@ -159,12 +160,118 @@
   </div>
 </div>
 
+<!-- Today Focus Modal -->
+<div class="modal-bg" id="todayModal">
+  <div class="modal today-modal">
+    <div class="modal-head"><h3>&#127774; 今日专注</h3><button class="modal-x" id="todayModalClose">&#10005;</button></div>
+    <div class="modal-body today-body">
+      <div class="today-intro">
+        <p>选择今天最重要的三件事，专注完成它们。</p>
+      </div>
+      <div class="today-tasks" id="todayTasks">
+        <!-- 动态生成今日任务列表 -->
+      </div>
+      <div class="today-empty" id="todayEmpty" style="display:none">
+        <p>今天还没有安排任务，去创建或分配一些任务吧！</p>
+        <button class="dbtn dbtn-primary" id="todayCreateBtn">创建新任务</button>
+      </div>
+      <div class="today-mini-start" id="todayMiniStart" style="display:none">
+        <h4>&#128161; 最小可开始版本</h4>
+        <p id="miniStartText">选择一个任务开始吧！</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Tomato Timer Modal -->
+<div class="modal-bg" id="tomatoModal">
+  <div class="modal tomato-modal">
+    <div class="modal-head"><h3>&#127813; 番茄计时器</h3><button class="modal-x" id="tomatoModalClose">&#10005;</button></div>
+    <div class="modal-body tomato-body">
+      <div class="tomato-task-select">
+        <label>当前任务</label>
+        <select id="tomatoTaskSelect">
+          <option value="">-- 选择要专注的任务 --</option>
+        </select>
+      </div>
+      <div class="tomato-display">
+        <div class="tomato-time" id="tomatoTime">25:00</div>
+        <div class="tomato-status" id="tomatoStatus">准备开始</div>
+      </div>
+      <div class="tomato-progress">
+        <div class="tomato-bar" id="tomatoBar"></div>
+      </div>
+      <div class="tomato-controls">
+        <button class="dbtn dbtn-primary" id="tomatoStart">&#9654; 开始</button>
+        <button class="dbtn" id="tomatoPause" style="display:none">&#9208; 暂停</button>
+        <button class="dbtn" id="tomatoStop">&#9209; 停止</button>
+        <button class="dbtn dbtn-success" id="tomatoComplete" style="display:none">&#10004; 完成</button>
+      </div>
+      <div class="tomato-settings">
+        <div class="tomato-setting-row">
+          <label>专注时长</label>
+          <select id="tomatoDuration">
+            <option value="15">15分钟</option>
+            <option value="25" selected>25分钟</option>
+            <option value="45">45分钟</option>
+            <option value="60">60分钟</option>
+          </select>
+        </div>
+        <div class="tomato-setting-row">
+          <label>休息时长</label>
+          <select id="tomatoBreak">
+            <option value="5" selected>5分钟</option>
+            <option value="10">10分钟</option>
+            <option value="15">15分钟</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Confirm -->
 <div class="modal-bg confirm-modal" id="confirmModal">
   <div class="modal" style="max-width:360px">
     <div class="modal-head"><h3 id="cfmTitle">确认</h3><button class="modal-x" id="confirmModalClose">&#10005;</button></div>
     <div class="modal-body"><p id="cfmMsg" style="font-size:13px"></p></div>
     <div class="modal-foot"><button class="dbtn" id="confirmModalCancel">取消</button><button class="dbtn dbtn-danger" id="cfmOk">确认</button></div>
+  </div>
+</div>
+
+<!-- Subtask Detail Modal -->
+<div class="modal-bg" id="subtaskModal">
+  <div class="modal subtask-detail-modal">
+    <div class="modal-head"><h3>&#128203; 子任务详情</h3><button class="modal-x" id="subtaskModalClose">&#10005;</button></div>
+    <div class="modal-body subtask-detail-body">
+      <div class="subtask-detail-header">
+        <input type="checkbox" class="subtask-detail-checkbox" id="subtaskDetailCheck">
+        <span class="subtask-detail-title" id="subtaskDetailTitle">子任务标题</span>
+      </div>
+      <div class="subtask-detail-parent" id="subtaskDetailParent">所属任务：任务标题</div>
+      <div class="subtask-detail-section">
+        <h4>预估工时</h4>
+        <div class="subtask-detail-time">
+          <input type="number" id="subtaskDetailHours" min="0.5" step="0.5" value="1">
+          <span>小时</span>
+        </div>
+      </div>
+      <div class="subtask-detail-section">
+        <h4>实际耗时</h4>
+        <div class="subtask-detail-time">
+          <input type="number" id="subtaskDetailActual" min="0" step="0.5" value="0" placeholder="手动输入或使用番茄计时器">
+          <button class="dbtn" id="subtaskStartTomato">&#127813; 开始番茄</button>
+        </div>
+      </div>
+      <div class="subtask-detail-section">
+        <h4>备注</h4>
+        <textarea id="subtaskDetailNotes" placeholder="添加备注..." style="width:100%;min-height:60px;padding:8px;border:1px solid var(--border-1);border-radius:var(--radius-sm);background:var(--bg-3);color:var(--text-1);font-size:12px;resize:vertical"></textarea>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="dbtn" id="subtaskModalCancel">取消</button>
+      <button class="dbtn dbtn-primary" id="subtaskModalSave">保存</button>
+    </div>
   </div>
 </div>
 
