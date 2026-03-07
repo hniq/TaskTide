@@ -113,13 +113,15 @@ function normalizeWeeklyAvailabilitySlots(slots) {
   const normalized = [];
 
   slots.forEach(slot => {
-    const dayOfWeek = Number(slot?.dayOfWeek);
+    const dayRaw = slot?.weekday ?? slot?.dayOfWeek;
+    const dayOfWeek = Number(dayRaw);
     const startMin = parseTimeToMinutes(String(slot?.start || ''));
     const endMin = parseTimeToMinutes(String(slot?.end || ''));
     if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) return;
     if (startMin == null || endMin == null || endMin <= startMin) return;
 
     const safe = {
+      weekday: dayOfWeek,
       dayOfWeek,
       start: minutesToTime(startMin),
       end: minutesToTime(endMin)
@@ -138,8 +140,63 @@ function normalizeWeeklyAvailabilitySlots(slots) {
   return normalized;
 }
 
+function syncWeeklyAvailabilitySettingsObject(settingsObj) {
+  if (!settingsObj || typeof settingsObj !== 'object') return false;
+  const beforeWeekly = JSON.stringify(settingsObj.weeklyAvailability || []);
+  const beforeWeeklySlots = JSON.stringify(settingsObj.weeklyAvailabilitySlots || []);
+  const source = Array.isArray(settingsObj.weeklyAvailability) && settingsObj.weeklyAvailability.length
+    ? settingsObj.weeklyAvailability
+    : settingsObj.weeklyAvailabilitySlots;
+  const normalized = normalizeWeeklyAvailabilitySlots(source || []);
+
+  settingsObj.weeklyAvailability = normalized.map(slot => ({
+    weekday: slot.weekday,
+    start: slot.start,
+    end: slot.end
+  }));
+  settingsObj.weeklyAvailabilitySlots = normalized.map(slot => ({
+    dayOfWeek: slot.dayOfWeek,
+    start: slot.start,
+    end: slot.end
+  }));
+
+  return (
+    beforeWeekly !== JSON.stringify(settingsObj.weeklyAvailability) ||
+    beforeWeeklySlots !== JSON.stringify(settingsObj.weeklyAvailabilitySlots)
+  );
+}
+
 function getActiveWeeklyAvailabilitySlots() {
-  return normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+  const source = (Array.isArray(settings.weeklyAvailability) && settings.weeklyAvailability.length)
+    ? settings.weeklyAvailability
+    : settings.weeklyAvailabilitySlots;
+  return normalizeWeeklyAvailabilitySlots(source || []);
+}
+
+function getConfiguredSlotLabelsForDate(dateInput, weeklySlots = null) {
+  const slots = weeklySlots ?? getActiveWeeklyAvailabilitySlots();
+  if (!slots.length) return [];
+  const date = typeof dateInput === 'string'
+    ? new Date(`${dateInput}T00:00:00`)
+    : new Date(dateInput);
+  if (Number.isNaN(date.getTime())) return [];
+  const day = date.getDay();
+  return slots
+    .filter(slot => slot.dayOfWeek === day)
+    .map(slot => `${slot.start}-${slot.end}`);
+}
+
+function getDefaultSlotLabelForDate(dateInput, weeklySlots = null) {
+  const labels = getConfiguredSlotLabelsForDate(dateInput, weeklySlots);
+  return labels[0] || '';
+}
+
+function getSlotLabelFromSlot(slot) {
+  if (!slot) return '';
+  const startMin = Number(slot.startMin);
+  const endMin = Number(slot.endMin);
+  if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || endMin <= startMin) return '';
+  return `${minutesToTime(startMin)}-${minutesToTime(endMin)}`;
 }
 
 function getDailyCapacityForDate(dateInput, weeklySlots = null) {
@@ -212,6 +269,7 @@ function buildCapacitySlots({
           dateStr: ds,
           dateObj: new Date(d),
           startMin,
+          endMin,
           capacity,
           remaining: capacity
         });
@@ -224,6 +282,7 @@ function buildCapacitySlots({
         dateStr: ds,
         dateObj: new Date(d),
         startMin: 0,
+        endMin: null,
         capacity,
         remaining: capacity
       });
@@ -253,15 +312,32 @@ function buildCapacitySlots({
     .sort((a, b) => (a.dateObj - b.dateObj) || (a.startMin - b.startMin));
 }
 
+function buildAvailableSlots(settingsObj, today, assignmentDeadline, existingAssignedDays, maxDays = 30) {
+  const safeSettings = settingsObj || {};
+  const weeklySource = (Array.isArray(safeSettings.weeklyAvailability) && safeSettings.weeklyAvailability.length)
+    ? safeSettings.weeklyAvailability
+    : safeSettings.weeklyAvailabilitySlots;
+  const weeklySlots = normalizeWeeklyAvailabilitySlots(weeklySource || []);
+  return buildCapacitySlots({
+    startDate: today,
+    assignmentDeadline,
+    maxDays,
+    weeklySlots,
+    usedHoursByDate: existingAssignedDays || {},
+    fallbackDailyHours: Number(safeSettings.dailyWorkHours) || 4
+  });
+}
+
 function ensureDayAssignmentObject(task, dateStr) {
   if (!task.assignedDays) task.assignedDays = {};
   if (!task.assignedDays[dateStr]) {
-    task.assignedDays[dateStr] = { subtaskIds: [], hours: 0 };
+    task.assignedDays[dateStr] = { subtaskIds: [], hours: 0, slotBySubtaskId: {} };
   }
   if (typeof task.assignedDays[dateStr] === 'number') {
     task.assignedDays[dateStr] = {
       subtaskIds: ['__whole_' + task.id],
-      hours: Number(task.assignedDays[dateStr]) || 0
+      hours: Number(task.assignedDays[dateStr]) || 0,
+      slotBySubtaskId: {}
     };
   }
   if (!Array.isArray(task.assignedDays[dateStr].subtaskIds)) {
@@ -270,10 +346,17 @@ function ensureDayAssignmentObject(task, dateStr) {
   if (!Number.isFinite(Number(task.assignedDays[dateStr].hours))) {
     task.assignedDays[dateStr].hours = 0;
   }
+  if (
+    !task.assignedDays[dateStr].slotBySubtaskId ||
+    typeof task.assignedDays[dateStr].slotBySubtaskId !== 'object' ||
+    Array.isArray(task.assignedDays[dateStr].slotBySubtaskId)
+  ) {
+    task.assignedDays[dateStr].slotBySubtaskId = {};
+  }
   return task.assignedDays[dateStr];
 }
 
-function appendAssignment(task, dateStr, subtaskId, hours) {
+function appendAssignment(task, dateStr, subtaskId, hours, slotLabel = '') {
   const assignHours = roundHours(hours);
   if (assignHours <= 0) return;
   const dayData = ensureDayAssignmentObject(task, dateStr);
@@ -281,6 +364,17 @@ function appendAssignment(task, dateStr, subtaskId, hours) {
     dayData.subtaskIds.push(subtaskId);
   }
   dayData.hours = roundHours((dayData.hours || 0) + assignHours);
+  const safeLabel = String(slotLabel || '').trim();
+  if (!safeLabel) return;
+  const current = String(dayData.slotBySubtaskId[subtaskId] || '').trim();
+  if (!current) {
+    dayData.slotBySubtaskId[subtaskId] = safeLabel;
+    return;
+  }
+  const labels = current.split(' / ').map(item => item.trim()).filter(Boolean);
+  if (labels.includes(safeLabel)) return;
+  labels.push(safeLabel);
+  dayData.slotBySubtaskId[subtaskId] = labels.join(' / ');
 }
 
 function getSubtaskGroupKey(title) {
@@ -291,7 +385,17 @@ function getSubtaskGroupKey(title) {
   while (indexSuffixPattern.test(key)) {
     key = key.replace(indexSuffixPattern, '').trim();
   }
-  return key.toLowerCase() || '__ungrouped__';
+  return classifySubtaskGroup(key);
+}
+
+function classifySubtaskGroup(title) {
+  const text = String(title || '').toLowerCase();
+  if (!text) return 'other';
+  if (/\u6587\u732E|\u9605\u8BFB|\u67E5\u8D44\u6599|read|literature/i.test(text)) return 'reading';
+  if (/\u521D\u7A3F|\u5199\u4F5C|\u64B0\u5199|write|draft/i.test(text)) return 'writing';
+  if (/\u4FEE\u6539|\u6DA6\u8272|\u5B8C\u5584|revise|polish/i.test(text)) return 'revise';
+  if (/\u6392\u7248|\u683C\u5F0F|format/i.test(text)) return 'format';
+  return 'other';
 }
 
 function interleaveSubtasksByGroup(items) {
@@ -320,27 +424,50 @@ function interleaveSubtasksByGroup(items) {
   return mixed;
 }
 
-function pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, groupKey) {
-  let fallback = null;
+function pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, slotTaskDateState, groupKey, taskId) {
+  let bestSlot = null;
+  let bestRank = Number.POSITIVE_INFINITY;
+  const usedDates = slotTaskDateState.get(taskId) || new Set();
+
   for (const slot of slotList) {
     if (slot.remaining <= SLOT_EPSILON) continue;
     if (assignmentDeadline && slot.dateObj > assignmentDeadline) break;
-    if (!fallback) fallback = slot;
+
     const usedGroups = slotGroupState.get(slot.key);
-    if (!usedGroups || !usedGroups.has(groupKey)) return slot;
+    const hasGroupInSlot = !!(usedGroups && usedGroups.has(groupKey));
+    const hasTaskOnDate = usedDates.has(slot.dateStr);
+
+    let rank = 3;
+    if (!hasGroupInSlot && !hasTaskOnDate) rank = 0;
+    else if (!hasGroupInSlot && hasTaskOnDate) rank = 1;
+    else if (hasGroupInSlot && !hasTaskOnDate) rank = 2;
+
+    if (rank < bestRank) {
+      bestRank = rank;
+      bestSlot = slot;
+      if (rank === 0) break;
+    }
   }
-  return fallback;
+
+  return bestSlot;
 }
 
-function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, slotGroupState) {
+function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, slotGroupState, slotTaskDateState) {
   let remaining = roundHours(Number(sub.estimatedHours) || 1);
   const groupKey = getSubtaskGroupKey(sub.title);
 
   while (remaining > SLOT_EPSILON) {
-    const slot = pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, groupKey);
+    const slot = pickSlotForGroup(
+      slotList,
+      assignmentDeadline,
+      slotGroupState,
+      slotTaskDateState,
+      groupKey,
+      task.id
+    );
     if (!slot) break;
     const assign = Math.min(remaining, slot.remaining);
-    appendAssignment(task, slot.dateStr, sub.id, assign);
+    appendAssignment(task, slot.dateStr, sub.id, assign, getSlotLabelFromSlot(slot));
     slot.remaining = roundHours(slot.remaining - assign);
     remaining = roundHours(remaining - assign);
 
@@ -350,6 +477,13 @@ function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, s
       slotGroupState.set(slot.key, groups);
     }
     groups.add(groupKey);
+
+    let taskDates = slotTaskDateState.get(task.id);
+    if (!taskDates) {
+      taskDates = new Set();
+      slotTaskDateState.set(task.id, taskDates);
+    }
+    taskDates.add(slot.dateStr);
   }
 
   return remaining <= SLOT_EPSILON;
@@ -377,7 +511,8 @@ let detailSubDragId = null;     // 详情面板子任务拖拽排序
 /** 初始化应用：加载数据，设置事件监听器，首次渲染 **/
 function init() {
   settings = loadSettings();
-  settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+  const normalizedSettingsChanged = syncWeeklyAvailabilitySettingsObject(settings);
+  if (normalizedSettingsChanged) saveSettings(settings);
   tasks = loadTasks();
   migrateTasks();
   sortMode = settings.defaultSortMode || 'deadline';
@@ -651,13 +786,26 @@ function buildDayMap(activeTasks) {
       if (!dayMap[ds]) dayMap[ds] = [];
       const dayData = t.assignedDays[ds];
       if (typeof dayData === 'number') {
-        dayMap[ds].push({ task: t, sub: { id: '__whole_' + t.id, title: t.title, estimatedHours: dayData } });
+        dayMap[ds].push({
+          task: t,
+          sub: { id: '__whole_' + t.id, title: t.title, estimatedHours: dayData },
+          slotLabel: ''
+        });
       } else if (dayData && dayData.subtaskIds) {
+        const slotBySubtaskId = (dayData.slotBySubtaskId && typeof dayData.slotBySubtaskId === 'object')
+          ? dayData.slotBySubtaskId
+          : {};
         dayData.subtaskIds.forEach(sid => {
           let sub;
           if (sid.startsWith('__whole_')) { sub = { id: sid, title: t.title, estimatedHours: t.estimatedHours || 0 }; }
           else { sub = t.subtasks.find(s => s.id === sid); }
-          if (sub) dayMap[ds].push({ task: t, sub });
+          if (sub) {
+            dayMap[ds].push({
+              task: t,
+              sub,
+              slotLabel: String(slotBySubtaskId[sid] || '')
+            });
+          }
         });
       }
     });
@@ -729,6 +877,7 @@ function renderWeek() {
     const d = new Date(start); d.setDate(d.getDate() + i);
     const ds = fmtDate(d);
     const isToday = ds === today;
+    const configuredSlotLabels = getConfiguredSlotLabelsForDate(ds);
     let list = dayMap[ds] || [];
     
     // 根据 Eisenhower 象限排序，未指定象限的放在最后
@@ -742,20 +891,30 @@ function renderWeek() {
     const hrs = list.reduce((s, x) => s + (x.sub.estimatedHours || 0), 0);
     const dayCapacity = getDailyCapacityForDate(ds);
     const over = dayCapacity > 0 ? hrs > dayCapacity : hrs > 0;
+    const slotHeader = configuredSlotLabels.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin-top:4px;">
+          ${configuredSlotLabels.map(label => `<span style="font-size:10px;line-height:1;padding:2px 6px;border-radius:10px;background:var(--bg-3);color:var(--text-3);">${esc(label)}</span>`).join('')}
+        </div>`
+      : '';
 
     html += `<div class="week-col" data-date="${ds}">
       <div class="week-col-header">
         <div class="wdate${isToday ? ' is-today' : ''}">${d.getDate()}</div>
         <div class="wday">${WEEKDAYS[d.getDay()]}</div>
         <div class="whours${over ? ' over' : ''}">${hrs}h / ${dayCapacity}h</div>
+        ${slotHeader}
       </div>
       <div class="week-col-body" data-date="${ds}">
         ${list.length ? list.map(x => {
           const isCompleted = x.sub.completed ? ' completed' : '';
+          const slotLabel = String(x.slotLabel || '').trim() || (configuredSlotLabels.length === 1 ? configuredSlotLabels[0] : '');
+          const slotBadge = slotLabel
+            ? `<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:10px;background:var(--bg-3);color:var(--text-3);margin-right:6px;">${esc(slotLabel)}</span>`
+            : '';
           return `<div class="week-task ${getQClass(x.task.eisenhowerQuadrant)}${isCompleted}" draggable="true" data-sid="${x.sub.id}" data-tid="${x.task.id}">
           <div class="week-task-title">${esc(x.sub.title)}</div>
           <div class="week-task-parent">${esc(x.task.title)}</div>
-          <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
+          <div class="week-task-hours">${slotBadge}${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
         </div>`;
         }).join('') : '<div class="week-empty">暂无任务</div>'}
       </div>
@@ -867,6 +1026,9 @@ function handleCalendarDrop(targetDate) {
         if (idx > -1) {
           dayData.subtaskIds.splice(idx, 1);
           dayData.hours -= subtask.estimatedHours;
+          if (dayData.slotBySubtaskId && typeof dayData.slotBySubtaskId === 'object') {
+            delete dayData.slotBySubtaskId[draggedSubtaskId];
+          }
           if (dayData.hours <= 0 || dayData.subtaskIds.length === 0) {
             delete task.assignedDays[ds];
           }
@@ -878,19 +1040,32 @@ function handleCalendarDrop(targetDate) {
   // 确保目标日期有分配对象
   if (!task.assignedDays) task.assignedDays = {};
   if (!task.assignedDays[targetDate]) {
-    task.assignedDays[targetDate] = { subtaskIds: [], hours: 0 };
+    task.assignedDays[targetDate] = { subtaskIds: [], hours: 0, slotBySubtaskId: {} };
   }
   let targetDay = task.assignedDays[targetDate];
   
   // 如果目标日期是以数字形式存在（旧格式），则转换为对象格式
   if (typeof targetDay === 'number') {
-    task.assignedDays[targetDate] = { subtaskIds: ['__whole_' + task.id], hours: targetDay };
+    task.assignedDays[targetDate] = {
+      subtaskIds: ['__whole_' + task.id],
+      hours: targetDay,
+      slotBySubtaskId: {}
+    };
     targetDay = task.assignedDays[targetDate];
+  }
+  if (!targetDay.slotBySubtaskId || typeof targetDay.slotBySubtaskId !== 'object') {
+    targetDay.slotBySubtaskId = {};
   }
   
   if (!targetDay.subtaskIds.includes(draggedSubtaskId)) {
     targetDay.subtaskIds.push(draggedSubtaskId);
     targetDay.hours += subtask.estimatedHours;
+  }
+  const movedSlotLabel = getDefaultSlotLabelForDate(targetDate);
+  if (movedSlotLabel) {
+    targetDay.slotBySubtaskId[draggedSubtaskId] = movedSlotLabel;
+  } else {
+    delete targetDay.slotBySubtaskId[draggedSubtaskId];
   }
   
   // 如果是拖动子任务，则标记为手动分配并记录分配日期
@@ -925,6 +1100,9 @@ function removeFromCalendar(tid, sid, date) {
     if (idx > -1) {
       const sub = task.subtasks.find(s => s.id === sid);
       dayData.subtaskIds.splice(idx, 1);
+      if (dayData.slotBySubtaskId && typeof dayData.slotBySubtaskId === 'object') {
+        delete dayData.slotBySubtaskId[sid];
+      }
       if (sub) dayData.hours -= sub.estimatedHours;
       if (dayData.subtaskIds.length === 0 || dayData.hours <= 0) {
         delete task.assignedDays[date];
@@ -1108,15 +1286,29 @@ function replaceAssignmentIds(task, oldSid, oldHours, newSubs) {
 
     // 如果是旧格式的数字分配，且正好对应被拆分的子任务，则转换为对象格式并替换为新子任务 ID
     if (typeof dayData === 'number') {
-      task.assignedDays[date] = { subtaskIds: ['__whole_' + task.id], hours: dayData };
+      task.assignedDays[date] = {
+        subtaskIds: ['__whole_' + task.id],
+        hours: dayData,
+        slotBySubtaskId: {}
+      };
       dayData = task.assignedDays[date];
     }
 
     if (!dayData.subtaskIds) return;
     const idx = dayData.subtaskIds.indexOf(oldSid);
     if (idx === -1) return;
+    if (!dayData.slotBySubtaskId || typeof dayData.slotBySubtaskId !== 'object') {
+      dayData.slotBySubtaskId = {};
+    }
+    const oldSlotLabel = String(dayData.slotBySubtaskId[oldSid] || '').trim();
+    delete dayData.slotBySubtaskId[oldSid];
 
     dayData.subtaskIds.splice(idx, 1, ...newSids);
+    if (oldSlotLabel) {
+      newSids.forEach(newSid => {
+        dayData.slotBySubtaskId[newSid] = oldSlotLabel;
+      });
+    }
     dayData.hours = Math.max(0, (dayData.hours || 0) - oldHours + newTotalHours);
 
     if (dayData.subtaskIds.length === 0 || dayData.hours <= 0) {
@@ -2045,15 +2237,8 @@ function autoAssign() {
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const weeklySlots = getActiveWeeklyAvailabilitySlots();
   const usedByDate = getUsedHoursByDate(active);
-  const capacitySlots = buildCapacitySlots({
-    startDate: today,
-    maxDays: 30,
-    weeklySlots,
-    usedHoursByDate: usedByDate,
-    fallbackDailyHours: settings.dailyWorkHours || 4
-  });
+  const capacitySlots = buildAvailableSlots(settings, today, null, usedByDate, 30);
 
   if (!capacitySlots.length) {
     toast('No available slot for auto assignment', 'warning');
@@ -2093,13 +2278,17 @@ function autoAssign() {
     if (!task.assignedDays) task.assignedDays = {};
 
     const slotGroupState = new Map();
+    const slotTaskDateState = new Map([
+      [task.id, new Set(Object.keys(task.assignedDays || {}))]
+    ]);
     items.forEach(sub => {
       const placed = assignSubtaskToCapacitySlots(
         task,
         sub,
         capacitySlots,
         assignmentDeadline,
-        slotGroupState
+        slotGroupState,
+        slotTaskDateState
       );
       if (!placed) warns.add(task.title);
     });
@@ -2180,16 +2369,8 @@ function autoAssignSingleTask(task) {
   const assignmentDeadline = getAssignmentDeadline(task, today, {});
 
   const active = tasks.filter(t => t.status === 'active');
-  const weeklySlots = getActiveWeeklyAvailabilitySlots();
   const usedByDate = getUsedHoursByDate(active);
-  const capacitySlots = buildCapacitySlots({
-    startDate: today,
-    assignmentDeadline,
-    maxDays: 30,
-    weeklySlots,
-    usedHoursByDate: usedByDate,
-    fallbackDailyHours: settings.dailyWorkHours || 4
-  });
+  const capacitySlots = buildAvailableSlots(settings, today, assignmentDeadline, usedByDate, 30);
 
   if (!capacitySlots.length) {
     toast('No available slot for auto assignment', 'warning');
@@ -2199,6 +2380,9 @@ function autoAssignSingleTask(task) {
   if (!task.assignedDays) task.assignedDays = {};
 
   const slotGroupState = new Map();
+  const slotTaskDateState = new Map([
+    [task.id, new Set(Object.keys(task.assignedDays || {}))]
+  ]);
   let hasUnplaced = false;
   items.forEach(sub => {
     const placed = assignSubtaskToCapacitySlots(
@@ -2206,7 +2390,8 @@ function autoAssignSingleTask(task) {
       sub,
       capacitySlots,
       assignmentDeadline,
-      slotGroupState
+      slotGroupState,
+      slotTaskDateState
     );
     if (!placed) hasUnplaced = true;
   });
@@ -2381,16 +2566,40 @@ function createFromAI() {
 }
 
 // ======== Settings ========
+function normalizeWeeklySlotRowsForEditor(slots = []) {
+  if (!Array.isArray(slots)) return [];
+  return slots.map(slot => {
+    let day = Number(slot?.weekday ?? slot?.dayOfWeek);
+    if (!Number.isInteger(day) || day < 0 || day > 6) day = 1;
+
+    let startMin = parseTimeToMinutes(String(slot?.start || ''));
+    if (startMin == null) startMin = 9 * 60;
+
+    let endMin = parseTimeToMinutes(String(slot?.end || ''));
+    if (endMin == null || endMin <= startMin) {
+      endMin = Math.min(startMin + 60, 24 * 60);
+      if (endMin <= startMin) startMin = Math.max(0, endMin - 60);
+    }
+
+    return {
+      weekday: day,
+      dayOfWeek: day,
+      start: minutesToTime(startMin),
+      end: minutesToTime(endMin)
+    };
+  });
+}
+
 function renderWeeklySlotEditor(slots = []) {
   const container = document.getElementById('sWeeklySlots');
-  const normalized = normalizeWeeklyAvailabilitySlots(slots);
-  if (!normalized.length) {
+  const rows = normalizeWeeklySlotRowsForEditor(slots);
+  if (!rows.length) {
     container.innerHTML = '<div class="weekly-slots-empty">未设置每周可用时间，将按默认时间分配任务</div>';
     return;
   }
 
   const dayOptions = WEEKDAY_PICKER.map(day => `<option value="${day.value}">${day.label}</option>`).join('');
-  container.innerHTML = normalized.map(slot => `
+  container.innerHTML = rows.map(slot => `
     <div class="weekly-slot-item">
       <select class="slot-day">${dayOptions}</select>
       <input type="time" class="slot-start" value="${slot.start}" step="900">
@@ -2402,13 +2611,14 @@ function renderWeeklySlotEditor(slots = []) {
 
   container.querySelectorAll('.weekly-slot-item').forEach((row, idx) => {
     const select = row.querySelector('.slot-day');
-    select.value = String(normalized[idx].dayOfWeek);
+    select.value = String(rows[idx].dayOfWeek);
   });
 }
 
 function collectWeeklySlotEditorRows() {
   const rows = Array.from(document.querySelectorAll('#sWeeklySlots .weekly-slot-item'));
   return rows.map(row => ({
+    weekday: Number(row.querySelector('.slot-day')?.value),
     dayOfWeek: Number(row.querySelector('.slot-day')?.value),
     start: String(row.querySelector('.slot-start')?.value || ''),
     end: String(row.querySelector('.slot-end')?.value || '')
@@ -2429,16 +2639,26 @@ function validateAndNormalizeWeeklySlotsFromEditor() {
 
 function addWeeklySlotRow() {
   const slots = collectWeeklySlotEditorRows();
-  slots.push({ dayOfWeek: 1, start: '09:00', end: '10:00' });
+  const last = slots[slots.length - 1];
+  const baseDay = Number(last?.weekday ?? last?.dayOfWeek);
+  const nextDay = Number.isInteger(baseDay) && baseDay >= 0 && baseDay <= 6
+    ? (baseDay + 2) % 7
+    : 1;
+  slots.push({
+    weekday: nextDay,
+    dayOfWeek: nextDay,
+    start: String(last?.start || '09:00'),
+    end: String(last?.end || '10:00')
+  });
   renderWeeklySlotEditor(slots);
 }
 
 function openSettings() {
-  settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+  syncWeeklyAvailabilitySettingsObject(settings);
   document.getElementById('sDailyH').value = settings.dailyWorkHours;
   document.getElementById('sSplitT').value = settings.splitThreshold;
   document.getElementById('sAutoAssign').value = String(settings.autoAssignAfterSplit);
-  renderWeeklySlotEditor(settings.weeklyAvailabilitySlots);
+  renderWeeklySlotEditor(settings.weeklyAvailability);
   document.getElementById('settingsModal').classList.add('open');
 }
 
@@ -2456,7 +2676,17 @@ function saveSettingsHandler() {
     toast('Please check weekly availability: end time must be after start time', 'error');
     return;
   }
-  settings.weeklyAvailabilitySlots = weeklySlots;
+  settings.weeklyAvailability = weeklySlots.map(slot => ({
+    weekday: slot.weekday,
+    start: slot.start,
+    end: slot.end
+  }));
+  settings.weeklyAvailabilitySlots = weeklySlots.map(slot => ({
+    dayOfWeek: slot.dayOfWeek,
+    start: slot.start,
+    end: slot.end
+  }));
+  syncWeeklyAvailabilitySettingsObject(settings);
 
   saveSettings(settings);
   closeSettingsModal();
@@ -2492,7 +2722,7 @@ function importData(e) {
         showConfirm('Import data', 'This will overwrite current data. Continue?', () => {
           tasks = data.tasks;
           if (data.settings) settings = { ...settings, ...data.settings };
-          settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+          syncWeeklyAvailabilitySettingsObject(settings);
           saveTasks(tasks);
           saveSettings(settings);
           migrateTasks();
@@ -2582,7 +2812,7 @@ function setupListeners() {
     const input = e.currentTarget;
     if (e.key === 'Tab' && !e.shiftKey && !input.value.trim()) {
       e.preventDefault();
-      input.value = '已完成任务';
+      input.value = '\u5B8C\u6210\u8BFE\u7A0B\u8BBA\u6587';
       input.setSelectionRange(input.value.length, input.value.length);
     }
   });
