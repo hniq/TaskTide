@@ -7,13 +7,353 @@
 easy task1: 统计耗时
 */
 
-
 import { 
   uid, fmtDate, esc, dlText, calcQuadrant, calcPriority, 
   getQClass, totalHours, getWeekStart, WEEKDAYS, Q_LABELS, Q_SHORT 
 } from './utils.js';
 import { loadTasks, saveTasks, loadSettings, saveSettings } from './storage.js';
 import { parseTaskWithAI, checkAIHealth } from './api.js';
+
+const SLOT_EPSILON = 1e-6;
+const WEEKDAY_PICKER = [
+  { value: 1, label: '周一' },
+  { value: 2, label: '周二' },
+  { value: 3, label: '周三' },
+  { value: 4, label: '周四' },
+  { value: 5, label: '周五' },
+  { value: 6, label: '周六' },
+  { value: 0, label: '周日' }
+];
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getEstimateMultiplier() {
+  const persistedTasks = loadTasks();
+  const ratios = [];
+
+  persistedTasks.forEach(task => {
+    if (!task || !Array.isArray(task.subtasks)) return;
+    task.subtasks.forEach(sub => {
+      const actual = Number(sub?.actualHours);
+      const estimated = Number(sub?.estimatedHours);
+      if (
+        Number.isFinite(actual) &&
+        actual > 0 &&
+        Number.isFinite(estimated) &&
+        estimated > 0
+      ) {
+        ratios.push(actual / estimated);
+      }
+    });
+  });
+
+  if (!ratios.length) return 1;
+  const avgRatio = ratios.reduce((sum, v) => sum + v, 0) / ratios.length;
+  return clamp(avgRatio, 0.7, 2.5);
+}
+window.getEstimateMultiplier = getEstimateMultiplier;
+
+function getAdjustedHours(hours, multiplier = 1) {
+  const value = Number(hours);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Number((value * multiplier).toFixed(2));
+}
+
+function adjustSubtasksForEstimate(subtasks) {
+  if (!Array.isArray(subtasks)) return [];
+  const multiplier = getEstimateMultiplier();
+  return subtasks.map(sub => ({
+    ...sub,
+    estimatedHours: getAdjustedHours(sub?.estimatedHours || 1, multiplier)
+  }));
+}
+
+function applyEstimateMultiplierToWholeTaskItems(items, multiplier) {
+  if (!Array.isArray(items)) return [];
+  return items.map(item => {
+    const isWholeTask = String(item?.id || '').startsWith('__whole_');
+    if (!isWholeTask) return item;
+    const rawHours = Number(item?.estimatedHours);
+    const safeHours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : 1;
+    return {
+      ...item,
+      estimatedHours: getAdjustedHours(safeHours, multiplier)
+    };
+  });
+}
+function roundHours(hours) {
+  const value = Number(hours);
+  if (!Number.isFinite(value)) return 0;
+  return Number(Math.max(0, value).toFixed(2));
+}
+
+function parseTimeToMinutes(value) {
+  if (typeof value !== 'string') return null;
+  const m = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (!Number.isInteger(h) || !Number.isInteger(min)) return null;
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+function minutesToTime(minutes) {
+  const total = Math.max(0, Math.min(24 * 60, Number(minutes) || 0));
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function normalizeWeeklyAvailabilitySlots(slots) {
+  if (!Array.isArray(slots)) return [];
+  const dedupe = new Set();
+  const normalized = [];
+
+  slots.forEach(slot => {
+    const dayOfWeek = Number(slot?.dayOfWeek);
+    const startMin = parseTimeToMinutes(String(slot?.start || ''));
+    const endMin = parseTimeToMinutes(String(slot?.end || ''));
+    if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) return;
+    if (startMin == null || endMin == null || endMin <= startMin) return;
+
+    const safe = {
+      dayOfWeek,
+      start: minutesToTime(startMin),
+      end: minutesToTime(endMin)
+    };
+    const key = `${safe.dayOfWeek}|${safe.start}|${safe.end}`;
+    if (!dedupe.has(key)) {
+      dedupe.add(key);
+      normalized.push(safe);
+    }
+  });
+
+  normalized.sort((a, b) =>
+    (a.dayOfWeek - b.dayOfWeek) ||
+    (parseTimeToMinutes(a.start) - parseTimeToMinutes(b.start))
+  );
+  return normalized;
+}
+
+function getActiveWeeklyAvailabilitySlots() {
+  return normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+}
+
+function getDailyCapacityForDate(dateInput, weeklySlots = null) {
+  const slots = weeklySlots ?? getActiveWeeklyAvailabilitySlots();
+  if (!slots.length) return Number(settings.dailyWorkHours) || 4;
+
+  const date = typeof dateInput === 'string'
+    ? new Date(`${dateInput}T00:00:00`)
+    : new Date(dateInput);
+  const day = date.getDay();
+  let totalMinutes = 0;
+
+  slots.forEach(slot => {
+    if (slot.dayOfWeek !== day) return;
+    const startMin = parseTimeToMinutes(slot.start);
+    const endMin = parseTimeToMinutes(slot.end);
+    if (startMin == null || endMin == null || endMin <= startMin) return;
+    totalMinutes += (endMin - startMin);
+  });
+  return roundHours(totalMinutes / 60);
+}
+
+function getUsedHoursByDate(taskList) {
+  const used = {};
+  taskList.forEach(task => {
+    if (!task?.assignedDays) return;
+    Object.entries(task.assignedDays).forEach(([ds, info]) => {
+      const hours = typeof info === 'number' ? Number(info) : Number(info?.hours || 0);
+      if (!Number.isFinite(hours) || hours <= 0) return;
+      used[ds] = roundHours((used[ds] || 0) + hours);
+    });
+  });
+  return used;
+}
+
+function buildCapacitySlots({
+  startDate,
+  assignmentDeadline = null,
+  maxDays = 30,
+  weeklySlots = null,
+  usedHoursByDate = {},
+  fallbackDailyHours = 4
+}) {
+  const normalizedWeeklySlots = weeklySlots ?? getActiveWeeklyAvailabilitySlots();
+  const useWeeklySlots = normalizedWeeklySlots.length > 0;
+
+  const start = new Date(startDate);
+  start.setHours(0, 0, 0, 0);
+  const maxDate = assignmentDeadline ? new Date(assignmentDeadline) : null;
+  if (maxDate) maxDate.setHours(0, 0, 0, 0);
+
+  const slotList = [];
+  for (let i = 0; i < maxDays; i++) {
+    const d = new Date(start);
+    d.setDate(d.getDate() + i);
+    if (maxDate && d > maxDate) break;
+
+    const ds = fmtDate(d);
+    if (useWeeklySlots) {
+      const day = d.getDay();
+      const dateRules = normalizedWeeklySlots.filter(x => x.dayOfWeek === day);
+      dateRules.forEach((rule, index) => {
+        const startMin = parseTimeToMinutes(rule.start);
+        const endMin = parseTimeToMinutes(rule.end);
+        if (startMin == null || endMin == null || endMin <= startMin) return;
+        const capacity = roundHours((endMin - startMin) / 60);
+        if (capacity <= 0) return;
+        slotList.push({
+          key: `${ds}|${startMin}|${endMin}|${index}`,
+          dateStr: ds,
+          dateObj: new Date(d),
+          startMin,
+          capacity,
+          remaining: capacity
+        });
+      });
+    } else {
+      const capacity = roundHours(Number(fallbackDailyHours) || 0);
+      if (capacity <= 0) continue;
+      slotList.push({
+        key: `${ds}|daily`,
+        dateStr: ds,
+        dateObj: new Date(d),
+        startMin: 0,
+        capacity,
+        remaining: capacity
+      });
+    }
+  }
+
+  const slotsByDate = new Map();
+  slotList.forEach(slot => {
+    if (!slotsByDate.has(slot.dateStr)) slotsByDate.set(slot.dateStr, []);
+    slotsByDate.get(slot.dateStr).push(slot);
+  });
+
+  slotsByDate.forEach((dateSlots, ds) => {
+    let used = Number(usedHoursByDate[ds]) || 0;
+    if (used <= 0) return;
+    dateSlots.sort((a, b) => a.startMin - b.startMin);
+    for (const slot of dateSlots) {
+      if (used <= SLOT_EPSILON) break;
+      const consumed = Math.min(slot.remaining, used);
+      slot.remaining = roundHours(slot.remaining - consumed);
+      used = roundHours(used - consumed);
+    }
+  });
+
+  return slotList
+    .filter(slot => slot.remaining > SLOT_EPSILON)
+    .sort((a, b) => (a.dateObj - b.dateObj) || (a.startMin - b.startMin));
+}
+
+function ensureDayAssignmentObject(task, dateStr) {
+  if (!task.assignedDays) task.assignedDays = {};
+  if (!task.assignedDays[dateStr]) {
+    task.assignedDays[dateStr] = { subtaskIds: [], hours: 0 };
+  }
+  if (typeof task.assignedDays[dateStr] === 'number') {
+    task.assignedDays[dateStr] = {
+      subtaskIds: ['__whole_' + task.id],
+      hours: Number(task.assignedDays[dateStr]) || 0
+    };
+  }
+  if (!Array.isArray(task.assignedDays[dateStr].subtaskIds)) {
+    task.assignedDays[dateStr].subtaskIds = [];
+  }
+  if (!Number.isFinite(Number(task.assignedDays[dateStr].hours))) {
+    task.assignedDays[dateStr].hours = 0;
+  }
+  return task.assignedDays[dateStr];
+}
+
+function appendAssignment(task, dateStr, subtaskId, hours) {
+  const assignHours = roundHours(hours);
+  if (assignHours <= 0) return;
+  const dayData = ensureDayAssignmentObject(task, dateStr);
+  if (!dayData.subtaskIds.includes(subtaskId)) {
+    dayData.subtaskIds.push(subtaskId);
+  }
+  dayData.hours = roundHours((dayData.hours || 0) + assignHours);
+}
+
+function getSubtaskGroupKey(title) {
+  let key = String(title || '').trim();
+  const sessionPattern = /\s*\(?\d+\/\d+\)?\s*$/;
+  key = key.replace(sessionPattern, '').trim();
+  const indexSuffixPattern = /(?:\(|\uFF08)\d+(?:\)|\uFF09)\s*$/;
+  while (indexSuffixPattern.test(key)) {
+    key = key.replace(indexSuffixPattern, '').trim();
+  }
+  return key.toLowerCase() || '__ungrouped__';
+}
+
+function interleaveSubtasksByGroup(items) {
+  const groups = new Map();
+  const order = [];
+  items.forEach(item => {
+    const key = getSubtaskGroupKey(item.title);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      order.push(key);
+    }
+    groups.get(key).push(item);
+  });
+
+  const mixed = [];
+  let hasNext = true;
+  while (hasNext) {
+    hasNext = false;
+    order.forEach(key => {
+      const list = groups.get(key);
+      if (!list || !list.length) return;
+      mixed.push(list.shift());
+      hasNext = true;
+    });
+  }
+  return mixed;
+}
+
+function pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, groupKey) {
+  let fallback = null;
+  for (const slot of slotList) {
+    if (slot.remaining <= SLOT_EPSILON) continue;
+    if (assignmentDeadline && slot.dateObj > assignmentDeadline) break;
+    if (!fallback) fallback = slot;
+    const usedGroups = slotGroupState.get(slot.key);
+    if (!usedGroups || !usedGroups.has(groupKey)) return slot;
+  }
+  return fallback;
+}
+
+function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, slotGroupState) {
+  let remaining = roundHours(Number(sub.estimatedHours) || 1);
+  const groupKey = getSubtaskGroupKey(sub.title);
+
+  while (remaining > SLOT_EPSILON) {
+    const slot = pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, groupKey);
+    if (!slot) break;
+    const assign = Math.min(remaining, slot.remaining);
+    appendAssignment(task, slot.dateStr, sub.id, assign);
+    slot.remaining = roundHours(slot.remaining - assign);
+    remaining = roundHours(remaining - assign);
+
+    let groups = slotGroupState.get(slot.key);
+    if (!groups) {
+      groups = new Set();
+      slotGroupState.set(slot.key, groups);
+    }
+    groups.add(groupKey);
+  }
+
+  return remaining <= SLOT_EPSILON;
+}
 
 // ======== State ========
 let tasks = [];
@@ -24,19 +364,20 @@ let selectedTaskId = null;
 let splitTargetId = null;
 let activeFilter = null;
 let confirmCb = null;
-let confirmCb2 = null;  // 第二个操作回调
+let confirmCb2 = null;  // 2026.03.05 17:13 - 新增二次确认回调
 let sortMode = 'deadline'; // 'deadline' | 'priority' | 'manual'
 
 // ======== Drag State ========
 let draggedTaskId = null;
 let draggedSubtaskId = null;
-let sidebarDragId = null;       // 侧边栏任务拖动排序
-let detailSubDragId = null;     // 详情页子任务拖动排序
+let sidebarDragId = null;       // 侧边栏任务拖拽排序
+let detailSubDragId = null;     // 详情面板子任务拖拽排序
 
 // ======== Init ========
-/** 初始化应用：加载数据、迁移、绑定事件、首次渲染 */
+/** 初始化应用：加载数据，设置事件监听器，首次渲染 **/
 function init() {
   settings = loadSettings();
+  settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
   tasks = loadTasks();
   migrateTasks();
   sortMode = settings.defaultSortMode || 'deadline';
@@ -46,7 +387,7 @@ function init() {
   setupListeners();
 }
 
-/** 数据迁移：为旧数据补全新增字段 */
+/** 迁移任务数据 **/
 function migrateTasks() {
   let changed = false;
   tasks.forEach(t => {
@@ -75,21 +416,21 @@ function renderAll() {
 }
 
 // ======== Sidebar ========
-/** 渲染侧边栏：包含排序、筛选、任务列表、已完成区域和统计 */
+/** 渲染侧边栏 */
 function renderSidebar() {
   const list = document.getElementById('taskList');
   let active = tasks.filter(t => t.status === 'active');
   if (activeFilter) active = active.filter(t => t.eisenhowerQuadrant === activeFilter);
 
-  // 排序逻辑
+  //
   active = sortTaskList(active);
 
-  // 同步排序下拉
+  // 
   const sortSelect = document.getElementById('sortSelect');
   if (sortSelect) sortSelect.value = sortMode;
 
   if (!active.length) {
-    list.innerHTML = '<div class="sidebar-empty">还没有任务<br>点击上方按钮或用 AI 输入框创建</div>';
+    list.innerHTML = '<div class="sidebar-empty">暂无任务</div>';
   } else {
     let html = active.map((t, idx) => {
       const dl = dlText(t.deadline);
@@ -98,14 +439,13 @@ function renderSidebar() {
       const pct = tot ? Math.round(done / tot * 100) : 0;
       
       return `<div class="tcard${selectedTaskId === t.id ? ' selected' : ''}" data-id="${t.id}" data-idx="${idx}" draggable="${sortMode === 'manual' ? 'true' : 'false'}">
-        ${sortMode === 'manual' ? '<span class="tcard-drag" title="拖动排序">&#8942;&#8942;</span>' : ''}
+        ${sortMode === 'manual' ? '<span class="tcard-drag" title="拖拽排序">&#8942;&#8942;</span>' : ''}
         <div class="tcard-top"><span class="tcard-q ${getQClass(t.eisenhowerQuadrant)}"></span><span class="tcard-title">${esc(t.title)}</span></div>
         <div class="tcard-meta"><span class="tcard-dl ${dl.cls}">${dl.text}</span>${tot ? `<span class="tcard-progress"><span class="progress-bar"><span class="progress-fill" style="width:${pct}%"></span></span>${done}/${tot}</span>` : ''}</div>
       </div>`;
     }).join('');
     list.innerHTML = html;
     
-    // 点击和拖动处理
     list.querySelectorAll('.tcard').forEach(card => {
       card.addEventListener('click', () => selectTask(card.dataset.id));
       if (sortMode === 'manual') {
@@ -118,10 +458,9 @@ function renderSidebar() {
     });
   }
 
-  // 侧边栏已完成任务区域
   renderSidebarCompleted();
 
-  // 统计
+  // 统计数据
   const allActive = tasks.filter(t => t.status === 'active');
   const completed = tasks.filter(t => t.status === 'completed');
   const todayStr = fmtDate(new Date());
@@ -129,22 +468,22 @@ function renderSidebar() {
   allActive.forEach(t => { 
     if (t.assignedDays && t.assignedDays[todayStr]) todayCount++; 
   });
-  document.getElementById('sidebarStats').innerHTML = 
-    `<span>共 ${allActive.length} 个任务</span><span>今日 ${todayCount} 项</span><span>已完成 ${completed.length}</span>`;
+  document.getElementById('sidebarStats').innerHTML =
+  `<span>共 ${allActive.length} 个任务</span><span>今日 ${todayCount} 项</span><span>已完成 ${completed.length}</span>`;
 
-  // 筛选按钮状态
+  // 更新筛选按钮状态
   const filterBtn = document.getElementById('filterBtn');
   filterBtn.classList.toggle('active', !!activeFilter);
   filterBtn.querySelector('span').textContent = activeFilter ? Q_SHORT[activeFilter] : '筛选';
 }
 
-/** 对任务列表按当前排序模式排序 */
+/** 对任务列表进行排序 */
 function sortTaskList(list) {
   const sorted = [...list];
   switch (sortMode) {
     case 'deadline':
       sorted.sort((a, b) => {
-        // 无截止日期排最后
+        // deadline 键可能不存在，放在最后；如果都不存在则视为相等
         if (!a.deadline && !b.deadline) return 0;
         if (!a.deadline) return 1;
         if (!b.deadline) return -1;
@@ -161,7 +500,7 @@ function sortTaskList(list) {
   return sorted;
 }
 
-/** 渲染侧边栏已完成任务折叠区域 */
+/** 渲染已完成任务 */
 function renderSidebarCompleted() {
   const completed = tasks.filter(t => t.status === 'completed');
   document.getElementById('sidebarCompCount').textContent = completed.length;
@@ -170,7 +509,7 @@ function renderSidebarCompleted() {
     list.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--text-4)">暂无已完成任务</div>';
     return;
   }
-  // 渲染已完成任务列表，包含恢复和删除按钮
+  // 渲染已完成任务列表，显示前20条，并添加恢复和删除按钮
   list.innerHTML = completed.slice(0, 20).map(t => `
     <div class="sidebar-comp-item" data-id="${t.id}">
       <span class="comp-q ${getQClass(t.eisenhowerQuadrant)}" style="background:var(--${(t.eisenhowerQuadrant||'q4').toLowerCase()})"></span>
@@ -181,8 +520,7 @@ function renderSidebarCompleted() {
       </div>
     </div>
   `).join('');
-  
-  // 绑定恢复按钮事件
+
   list.querySelectorAll('.comp-restore-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -190,30 +528,30 @@ function renderSidebarCompleted() {
     });
   });
   
-  // 绑定删除按钮事件
+  // 删除按钮事件监听，添加二次确认
   list.querySelectorAll('.comp-del-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const id = btn.dataset.id;
-      showConfirm('删除任务', '确定永久删除此任务？', () => {
+      showConfirm('删除任务', '确认要删除此任务吗？', () => {
         tasks = tasks.filter(x => x.id !== id);
         saveTasks(tasks);
         renderAll();
-        toast('已删除');
+        toast('Deleted');
       });
     });
   });
 }
 
 // ======== Sidebar Drag Reorder ========
-/** 侧边栏任务拖动开始 */
+/** 处理侧边栏拖拽开始 */
 function handleSidebarDragStart(e, taskId) {
   sidebarDragId = taskId;
   e.dataTransfer.effectAllowed = 'move';
   e.target.classList.add('dragging');
 }
 
-/** 侧边栏任务拖动经过 */
+/** 处理侧边栏拖拽经过 */
 function handleSidebarDragOver(e, card) {
   e.preventDefault();
   e.dataTransfer.dropEffect = 'move';
@@ -224,12 +562,12 @@ function handleSidebarDragOver(e, card) {
   card.classList.add(e.clientY < mid ? 'drop-before' : 'drop-after');
 }
 
-/** 侧边栏任务拖动离开 */
+/** 处理侧边栏拖拽离开 */
 function handleSidebarDragLeave(card) {
   card.classList.remove('drop-before', 'drop-after');
 }
 
-/** 侧边栏任务拖放完成 */
+/** 处理侧边栏拖拽放下 */
 function handleSidebarDrop(e, targetId) {
   e.preventDefault();
   if (!sidebarDragId || sidebarDragId === targetId) return;
@@ -238,7 +576,7 @@ function handleSidebarDrop(e, targetId) {
   const rect = card.getBoundingClientRect();
   const before = e.clientY < rect.top + rect.height / 2;
   
-  // 获取当前排序后的 active 列表
+  // 根据当前筛选和排序状态获取 active 列表，并找到拖动项和目标项的索引
   let active = tasks.filter(t => t.status === 'active');
   if (activeFilter) active = active.filter(t => t.eisenhowerQuadrant === activeFilter);
   active = sortTaskList(active);
@@ -253,14 +591,14 @@ function handleSidebarDrop(e, targetId) {
   const [moved] = active.splice(fromIdx, 1);
   active.splice(toIdx, 0, moved);
   
-  // 更新 manualOrder
+  // 更新所有任务的 manualOrder 字段
   active.forEach((t, i) => { t.manualOrder = i; });
   saveTasks(tasks);
   renderSidebar();
-  toast('排序已更新');
+  toast('Sort order updated');
 }
 
-/** 侧边栏拖动结束清理 */
+/** 处理侧边栏拖拽结束 */
 function handleSidebarDragEnd() {
   sidebarDragId = null;
   document.querySelectorAll('.tcard').forEach(c => c.classList.remove('dragging', 'drop-before', 'drop-after'));
@@ -303,7 +641,7 @@ function renderMainView() {
   else renderWeek();
 }
 
-/** 构建日期→任务映射表（兼容新旧数据格式） */
+/** 构建日期映射 */
 function buildDayMap(activeTasks) {
   const dayMap = {};
   activeTasks.forEach(t => {
@@ -350,7 +688,8 @@ function renderMonth() {
     const isToday = ds === today;
     const list = dayMap[ds] || [];
     const hrs = list.reduce((s, x) => s + (x.sub.estimatedHours || 0), 0);
-    const over = hrs > settings.dailyWorkHours;
+    const dayCapacity = getDailyCapacityForDate(ds);
+    const over = dayCapacity > 0 ? hrs > dayCapacity : hrs > 0;
     
     html += `<div class="cal-cell${isToday ? ' today' : ''}${over ? ' overloaded' : ''}" data-date="${ds}">
       <div class="cal-date"><span class="cal-date-num${isToday ? ' is-today' : ''}">${d}</span><span class="cal-hours${over ? ' over' : ''}">${hrs > 0 ? hrs + 'h' : ''}</span></div>
@@ -391,7 +730,7 @@ function renderWeek() {
     const isToday = ds === today;
     let list = dayMap[ds] || [];
     
-    // 按四象限优先级排序：Q1 > Q2 > Q3 > Q4
+    // 根据 Eisenhower 象限排序，未指定象限的放在最后
     const qOrder = { 'Q1': 0, 'Q2': 1, 'Q3': 2, 'Q4': 3 };
     list = [...list].sort((a, b) => {
       const qa = qOrder[a.task.eisenhowerQuadrant] ?? 3;
@@ -400,13 +739,14 @@ function renderWeek() {
     });
     
     const hrs = list.reduce((s, x) => s + (x.sub.estimatedHours || 0), 0);
-    const over = hrs > settings.dailyWorkHours;
+    const dayCapacity = getDailyCapacityForDate(ds);
+    const over = dayCapacity > 0 ? hrs > dayCapacity : hrs > 0;
 
     html += `<div class="week-col" data-date="${ds}">
       <div class="week-col-header">
         <div class="wdate${isToday ? ' is-today' : ''}">${d.getDate()}</div>
         <div class="wday">${WEEKDAYS[d.getDay()]}</div>
-        <div class="whours${over ? ' over' : ''}">${hrs}h / ${settings.dailyWorkHours}h</div>
+        <div class="whours${over ? ' over' : ''}">${hrs}h / ${dayCapacity}h</div>
       </div>
       <div class="week-col-body" data-date="${ds}">
         ${list.length ? list.map(x => {
@@ -416,23 +756,22 @@ function renderWeek() {
           <div class="week-task-parent">${esc(x.task.title)}</div>
           <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
         </div>`;
-        }).join('') : '<div class="week-empty">无任务</div>'}
+        }).join('') : '<div class="week-empty">暂无任务</div>'}
       </div>
     </div>`;
   }
   html += '</div>';
   body.innerHTML = html;
   
-  // 绑定日历拖拽事件
+  // 
   bindCalendarDragEvents();
   
-  // 绑定周视图内部拖动排序
   bindWeekTaskDrag();
 }
 
-/** 为日历视图绑定拖拽事件（月视图格子、周视图列） */
+/** 绑定日历拖拽事件 */
 function bindCalendarDragEvents() {
-  // 拖拽源：日历中的任务项
+  // 绑定拖拽开始事件
   document.querySelectorAll('.cal-task-mini[draggable], .week-task[draggable]').forEach(el => {
     el.addEventListener('dragstart', e => {
       draggedTaskId = el.dataset.tid;
@@ -443,7 +782,7 @@ function bindCalendarDragEvents() {
     el.addEventListener('dragend', () => { el.style.opacity = ''; });
   });
   
-  // 拖拽目标：日历格子/列
+  // 绑定拖拽目标事件
   const targets = document.querySelectorAll('.cal-cell[data-date], .week-col[data-date]');
   targets.forEach(cell => {
     cell.addEventListener('dragover', e => {
@@ -460,7 +799,7 @@ function bindCalendarDragEvents() {
     });
   });
   
-  // 周视图移除按钮
+  // 绑定移除按钮事件
   document.querySelectorAll('.week-task-rm').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
@@ -470,7 +809,7 @@ function bindCalendarDragEvents() {
   });
 }
 
-/** 绑定周视图内部任务拖动排序 */
+/** 绑定周视图内部拖拽事件 */
 function bindWeekTaskDrag() {
   const cols = document.querySelectorAll('.week-col-body');
   cols.forEach(col => {
@@ -482,7 +821,7 @@ function bindWeekTaskDrag() {
         e.preventDefault();
         if (!draggedTaskId || !draggedSubtaskId) return;
         
-        // 只在同一列内排序
+        //  确保拖动的任务/子任务属于当前日期的某个任务
         const parent = taskEl.closest('.week-col-body');
         if (parent.dataset.date !== date) return;
         
@@ -499,14 +838,14 @@ function bindWeekTaskDrag() {
   });
 }
 
-/** 处理日历拖拽放置：将任务/子任务移到目标日期 */
+/** 处理日历上的拖放事件，将任务/子任务分配到目标日期 */
 function handleCalendarDrop(targetDate) {
   if (!draggedTaskId || !draggedSubtaskId) return;
   
   const task = tasks.find(t => t.id === draggedTaskId);
   if (!task) return;
   
-  // 找到子任务信息
+  // 获取被拖动的子任务对象，如果是整个任务则构造一个临时对象
   let subtask;
   if (draggedSubtaskId.startsWith('__whole_')) {
     subtask = { id: draggedSubtaskId, title: task.title, estimatedHours: task.estimatedHours || 1 };
@@ -515,12 +854,12 @@ function handleCalendarDrop(targetDate) {
   }
   if (!subtask) return;
   
-  // 从原日期中移除
+  // 从原日期移除任务/子任务的分配
   if (task.assignedDays) {
     Object.keys(task.assignedDays).forEach(ds => {
       const dayData = task.assignedDays[ds];
       if (typeof dayData === 'number' && draggedSubtaskId.startsWith('__whole_')) {
-        // 整个任务格式，移除
+        // 整个任务格式，移除后直接删除日期分配
         delete task.assignedDays[ds];
       } else if (typeof dayData === 'object' && dayData.subtaskIds) {
         const idx = dayData.subtaskIds.indexOf(draggedSubtaskId);
@@ -535,14 +874,14 @@ function handleCalendarDrop(targetDate) {
     });
   }
   
-  // 添加到新日期
+  // 确保目标日期有分配对象
   if (!task.assignedDays) task.assignedDays = {};
   if (!task.assignedDays[targetDate]) {
     task.assignedDays[targetDate] = { subtaskIds: [], hours: 0 };
   }
   let targetDay = task.assignedDays[targetDate];
   
-  // 统一转为对象格式以支持子任务级别追踪
+  // 如果目标日期是以数字形式存在（旧格式），则转换为对象格式
   if (typeof targetDay === 'number') {
     task.assignedDays[targetDate] = { subtaskIds: ['__whole_' + task.id], hours: targetDay };
     targetDay = task.assignedDays[targetDate];
@@ -553,26 +892,26 @@ function handleCalendarDrop(targetDate) {
     targetDay.hours += subtask.estimatedHours;
   }
   
-  // 标记子任务为手动分配
+  // 如果是拖动子任务，则标记为手动分配并记录分配日期
   if (subtask.id && !subtask.id.startsWith('__whole_')) {
     subtask._manuallyAssigned = true;
     subtask._assignedDate = targetDate;
   }
   
-  // 如果是主任务拖到日期，更新 deadline
+  // 如果是拖动整个任务，则更新截止日期
   if (draggedSubtaskId.startsWith('__whole_')) {
     task.deadline = targetDate;
   }
   
   saveTasks(tasks);
   renderAll();
-  toast('已移到 ' + targetDate);
+  toast('Moved to ' + targetDate);
   
   draggedTaskId = null;
   draggedSubtaskId = null;
 }
 
-/** 从日历中移除某个任务/子任务的分配 */
+/** 从日历中移除任务/子任务的分配 */
 function removeFromCalendar(tid, sid, date) {
   const task = tasks.find(t => t.id === tid);
   if (!task || !task.assignedDays || !task.assignedDays[date]) return;
@@ -594,11 +933,11 @@ function removeFromCalendar(tid, sid, date) {
   
   saveTasks(tasks);
   renderAll();
-  toast('已移除');
+  toast('Removed from calendar');
 }
 
 // ======== Right Panel ========
-/** 渲染右侧面板：四象限矩阵和本周统计 */
+/** 渲染右侧统计面板 */
 function renderPanel() {
   const active = tasks.filter(t => t.status === 'active');
   const completed = tasks.filter(t => t.status === 'completed');
@@ -611,7 +950,7 @@ function renderPanel() {
     </div>`
   ).join('');
 
-  // 本周统计（含已完成数量）
+  // 绑定象限筛选事件
   const start = getWeekStart(new Date());
   let weekHours = 0, weekTasks = 0;
   for (let i = 0; i < 7; i++) {
@@ -625,7 +964,7 @@ function renderPanel() {
     });
   }
   
-  // 本周完成的任务数
+  // 统计本周完成的任务数
   const weekStart = getWeekStart(new Date());
   const weekEnd = new Date(weekStart); weekEnd.setDate(weekEnd.getDate() + 7);
   const weekCompleted = completed.filter(t => {
@@ -636,9 +975,9 @@ function renderPanel() {
   
   document.getElementById('weekStats').innerHTML = `
     <div class="stat-row"><span class="stat-label">本周任务</span><span class="stat-val">${weekTasks}</span></div>
-    <div class="stat-row"><span class="stat-label">预计工时</span><span class="stat-val">${weekHours}h</span></div>
+    <div class="stat-row"><span class="stat-label">预计用时</span><span class="stat-val">${weekHours}h</span></div>
     <div class="stat-row"><span class="stat-label">每日平均</span><span class="stat-val">${(weekHours / 7).toFixed(1)}h</span></div>
-    <div class="stat-row"><span class="stat-label">本周已完成</span><span class="stat-val" style="color:var(--success)">${weekCompleted}</span></div>
+    <div class="stat-row"><span class="stat-label">本周完成</span><span class="stat-val" style="color:var(--success)">${weekCompleted}</span></div>
   `;
 }
 
@@ -650,15 +989,14 @@ function toggleSidebarCompleted() {
   arrow.classList.toggle('open');
 }
 
-// ======== Chunk (切块) & Format Utilities ========
+// ======== Chunk & Format Utilities ========
 
-/** 将小时数舍入到 0.25 粒度，最小 0.25 */
 function roundToQuarter(hours) {
   const v = Math.round(hours / 0.25) * 0.25;
   return Math.max(0.25, v);
 }
+/** 将小时数格式化为字符串，1.5h 显示为 "1.5h"，0.5h 显示为 "30分钟" */
 
-/** 格式化时长显示：>=1h 显示 Xh，<1h 显示 XX分钟 */
 function formatDuration(hours) {
   const h = Number(hours);
   if (isNaN(h) || h <= 0) return '';
@@ -668,37 +1006,40 @@ function formatDuration(hours) {
   return `${Math.round(h * 60)}分钟`;
 }
 
-/** 去掉标题中已有的 session 后缀，如 " (2/3)" 或 " 2/3" */
+/** 从标题中去除类似 "(1/3)" 的会话后缀，返回纯标题 */
 function stripSessionSuffix(title) {
   return title.replace(/\s*\(?\d+\/\d+\)?\s*$/, '').trim();
 }
 
-/** 根据标题关键词生成 miniStart 提示（纯规则，不调 AI） */
+/** 根据任务标题生成一个适合的 mini start 提示语 */
 function genMiniStart(title) {
-  if (/代码|开发|实现|修复|bug|编程|编码/i.test(title)) {
-    return '打开项目跑起来，定位到相关文件，先改一个最小点';
+  if (/code|develop|implement|fix|bug|program/i.test(title)) {
+    return 'Open the project and make one small change first.';
   }
-  if (/阅读|文献|学习|读/.test(title)) {
-    return '打开材料，先扫读目录并写3个问题';
+  if (/read|study|review|paper|article/i.test(title)) {
+    return 'Open materials, scan the outline, and write 3 questions.';
   }
-  if (/写|撰写|文档|报告|总结/.test(title)) {
-    return '打开文档，先写5行大纲或列5个要点';
+  if (/write|draft|document|report|summary/i.test(title)) {
+    return 'Open the doc and write a 3-line outline first.';
   }
-  return '打开相关材料，写下3条要点，然后开始计时';
+  return 'Open related material, write one bullet, then start timer.';
 }
 
 /**
- * 对"当前这一条 subtask"做一次切块，返回 minutes 数组。
- * 递归友好：根据当前 totalMin 决定如何拆分。
+  * 将一个时间块（以分钟为单位）分割成多个子块，优先使用 90/45/25 分钟的块，剩余部分如果小于 10 分钟则合并到前一个块中。
+  * 返回一个数组，表示分割后的块的分钟数；如果无法分割（即已经是最小块），则返回 null。
+  * 例如：
+  * splitOnce(120) => [90, 30]
+  * splitOnce(100) => [90, 10]
+  * splitOnce(80) => [45, 25, 10]
  */
 function splitOnce(totalMin) {
-  // 太小不切
+  // 小于20分钟的块不再分割，直接返回 null
   if (totalMin < 20) return null;
 
-  // >= 90：拆出一个 90，remainder 按 45/25 继续
+  // 90分钟以上的块优先分割出90分钟
   if (totalMin >= 90) {
     if (totalMin === 90) {
-      // 对 90min 再切 → [45, 45]
       return [45, 45];
     }
     const chunks = [90];
@@ -715,10 +1056,8 @@ function splitOnce(totalMin) {
     return chunks.length > 1 ? chunks : null;
   }
 
-  // 45-89min 区间
   if (totalMin >= 45) {
     if (totalMin === 45) {
-      // 对 45min 再切 → [25, 20]
       return [25, 20];
     }
     const chunks = [45];
@@ -734,10 +1073,8 @@ function splitOnce(totalMin) {
     return chunks.length > 1 ? chunks : null;
   }
 
-  // 25-44min 区间
   if (totalMin >= 25) {
     if (totalMin === 25) {
-      // 对 25min 再切 → [15, 10]
       return [15, 10];
     }
     const first = Math.min(25, totalMin);
@@ -746,7 +1083,7 @@ function splitOnce(totalMin) {
       return [first, rem];
     }
     if (rem > 0 && rem < 10) {
-      return [first + rem]; // 合并，等于没拆
+      return [first + rem]; 
     }
     return null;
   }
@@ -759,7 +1096,7 @@ function splitOnce(totalMin) {
   return null;
 }
 
-/** 替换 assignedDays 中旧子任务 id 为新子任务 ids */
+/** 替换任务中分配了某个子任务的日期分配信息，适用于将一个子任务拆分成多个子任务的情况 */
 function replaceAssignmentIds(task, oldSid, oldHours, newSubs) {
   if (!task.assignedDays) return;
   const newSids = newSubs.map(s => s.id);
@@ -768,7 +1105,7 @@ function replaceAssignmentIds(task, oldSid, oldHours, newSubs) {
   Object.keys(task.assignedDays).forEach(date => {
     let dayData = task.assignedDays[date];
 
-    // 兼容 number 旧格式
+    // 如果是旧格式的数字分配，且正好对应被拆分的子任务，则转换为对象格式并替换为新子任务 ID
     if (typeof dayData === 'number') {
       task.assignedDays[date] = { subtaskIds: ['__whole_' + task.id], hours: dayData };
       dayData = task.assignedDays[date];
@@ -787,7 +1124,7 @@ function replaceAssignmentIds(task, oldSid, oldHours, newSubs) {
   });
 }
 
-/** 将指定子任务切块为多个 session（递归友好：每次只切一层） */
+/** 将一个子任务拆分成多个子任务，并更新相关的日期分配信息，适用于 "Chunk into Sessions" 功能 */
 function chunkSubtaskIntoSessions(taskId, subId) {
   const task = tasks.find(t => t.id === taskId);
   if (!task) return;
@@ -798,13 +1135,13 @@ function chunkSubtaskIntoSessions(taskId, subId) {
 
   const totalMin = Math.round(oldHours * 60);
   if (totalMin < 20) {
-    toast('已是最小块，无法继续切分');
+    toast('Chunk already minimal');
     return;
   }
 
   const chunks = splitOnce(totalMin);
   if (!chunks || chunks.length <= 1) {
-    toast('已是最小块，无法继续切分');
+    toast('Chunk already minimal');
     return;
   }
 
@@ -833,7 +1170,7 @@ function chunkSubtaskIntoSessions(taskId, subId) {
   saveTasks(tasks);
   renderAll();
   if (selectedTaskId === taskId) showTaskDetail(taskId);
-  toast(`已切块为 ${n} 个 session`);
+  toast(`Split into ${n} sessions`);
 }
 
 // ======== Task Selection & Detail (Inline Editing) ========
@@ -843,12 +1180,12 @@ function selectTask(id) {
   showTaskDetail(id);
 }
 
-/** 显示任务详情面板（内联编辑模式 + 集成拆分 + 单任务自动分配） */
+/** 显示任务详情面板（包含内联编辑 + 分块 + 自动分配） */
 function showTaskDetail(id) {
   const t = tasks.find(x => x.id === id);
   if (!t) return;
   
-  // 标题：内联编辑
+  // 内联编辑标题
   const titleInput = document.getElementById('detailTitleInput');
   titleInput.value = t.title;
   titleInput.onchange = () => {
@@ -858,7 +1195,7 @@ function showTaskDetail(id) {
       saveTasks(tasks);
       renderSidebar();
       renderMainView();
-      toast('标题已更新');
+      toast('Title updated');
     }
   };
   
@@ -874,7 +1211,7 @@ function showTaskDetail(id) {
     </div>
     
     <div class="detail-section">
-      <h4>基本信息</h4>
+      <h4>基本详情</h4>
       <div class="detail-inline-row">
         <label>截止日期</label>
         <input type="date" class="detail-inline-input" id="detailDeadline" value="${t.deadline || ''}">
@@ -891,18 +1228,18 @@ function showTaskDetail(id) {
       </div>
       <div class="detail-inline-row">
         <label>备注</label>
-        <textarea class="detail-notes-area" id="detailNotes" placeholder="可选备注...">${esc(t.notes || '')}</textarea>
+        <textarea class="detail-notes-area" id="detailNotes" placeholder="可选备注..">${esc(t.notes || '')}</textarea>
       </div>
     </div>
     
     <div class="detail-actions-row">
-      <button class="dbtn dbtn-primary" id="detailComplete">${t.status === 'completed' ? '恢复' : '完成'}</button>
+      <button class="dbtn dbtn-primary" id="detailComplete">${t.status === 'completed' ? '标记为未完成' : '标记为完成'}</button>
       <button class="dbtn dbtn-accent" id="detailAutoAssign">自动分配</button>
       <button class="dbtn dbtn-danger" id="detailDelete">删除</button>
     </div>
     
     <div class="detail-section">
-      <h4>子任务 (${done}/${tot})</h4>
+      <h4>子任务(${done}/${tot})</h4>
       <ul class="sub-list" id="detailSubList">
         ${t.subtasks.map((s, i) => `<li class="sub-item${s.completed ? ' done' : ''}" data-sid="${s.id}" draggable="true">
           <span class="sub-handle">&#8942;&#8942;</span>
@@ -913,12 +1250,12 @@ function showTaskDetail(id) {
           </div>
           <span class="sub-hours">${formatDuration(s.estimatedHours)}</span>
           ${s.actualMin != null ? `<span class="sub-actual">实际${s.actualMin}m</span>` : ''}
-          ${(s.estimatedHours >= 0.5 && !s.completed) ? `<button class="sub-chunk-btn" data-tid="${t.id}" data-sid="${s.id}">切块</button>` : ''}
+          ${(s.estimatedHours >= 0.5 && !s.completed) ? `<button class="sub-chunk-btn" data-tid="${t.id}" data-sid="${s.id}">拆分</button>` : ''}
           <span class="sub-rm" data-tid="${t.id}" data-sid="${s.id}">&#10005;</span>
         </li>`).join('')}
       </ul>
       <div class="sub-add-row">
-        <input type="text" id="newSubTitle" placeholder="新子任务">
+        <input type="text" id="newSubTitle" placeholder="新建子任务">
         <input type="number" id="newSubHours" placeholder="小时" min="0.5" step="0.5" value="1">
         <button class="sub-add-btn" id="addSubBtn">添加</button>
       </div>
@@ -929,7 +1266,7 @@ function showTaskDetail(id) {
         <h4>智能拆分</h4>
         <button class="dbtn" style="font-size:11px;padding:3px 10px" id="detailAISplitBtn">AI 拆分</button>
       </div>
-      <div class="fg" style="margin-bottom:8px"><label style="font-size:11px">总预估时长 (小时)</label><input type="number" id="detailSplitHours" min="0.5" step="0.5" value="${totalHours(t) || 8}" style="width:80px;padding:4px 8px;border:1px solid var(--border-0);border-radius:4px;font-size:12px;background:var(--bg-4);color:var(--text-1)"></div>
+      <div class="fg" style="margin-bottom:8px"><label style="font-size:11px">总预计时间(小时)</label><input type="number" id="detailSplitHours" min="0.5" step="0.5" value="${totalHours(t) || 8}" style="width:80px;padding:4px 8px;border:1px solid var(--border-0);border-radius:4px;font-size:12px;background:var(--bg-4);color:var(--text-1)"></div>
       <div id="detailSplitItems"></div>
       <div id="detailSplitTotal" style="font-size:11px;color:var(--text-3);text-align:right;margin-top:4px"></div>
       <button class="dbtn" style="margin-top:4px;font-size:11px" id="detailAddSplitItem">+ 添加子任务</button>
@@ -940,11 +1277,10 @@ function showTaskDetail(id) {
     </div>
   `;
   
-  // 打开面板
+  // 显示面板
   document.getElementById('detailMask').classList.add('open');
   document.getElementById('detailPanel').classList.add('open');
   
-  // ---- 绑定内联编辑事件 ----
   // 截止日期
   document.getElementById('detailDeadline').onchange = (e) => {
     t.deadline = e.target.value || null;
@@ -954,10 +1290,10 @@ function showTaskDetail(id) {
     renderMainView();
     renderPanel();
     showTaskDetail(id); // 刷新详情
-    toast('截止日期已更新');
+    toast('Deadline updated');
   };
   
-  // 重要/紧急程度
+  // 重要性/紧急性
   const impSlider = document.getElementById('detailImportance');
   const urgSlider = document.getElementById('detailUrgency');
   impSlider.oninput = () => {
@@ -972,10 +1308,10 @@ function showTaskDetail(id) {
     saveTasks(tasks);
     renderSidebar();
     renderPanel();
-    // 更新 badge
+    // 更新象限徽章
     const badge = document.querySelector('.detail-badge.' + getQClass(t.eisenhowerQuadrant));
     if (badge) badge.textContent = Q_LABELS[t.eisenhowerQuadrant];
-    toast('重要程度已更新');
+    toast('Importance updated');
   };
   urgSlider.onchange = () => {
     t.urgency = parseInt(urgSlider.value);
@@ -983,7 +1319,7 @@ function showTaskDetail(id) {
     saveTasks(tasks);
     renderSidebar();
     renderPanel();
-    toast('紧急程度已更新');
+    toast('Urgency updated');
   };
   
   // 备注
@@ -992,7 +1328,7 @@ function showTaskDetail(id) {
     saveTasks(tasks);
   };
   
-  // 完成/恢复按钮
+  // 完成/恢复任务
   document.getElementById('detailComplete').onclick = () => {
     if (t.status === 'completed') {
       restoreTask(id);
@@ -1001,37 +1337,37 @@ function showTaskDetail(id) {
     }
   };
   
-  // 单任务自动分配按钮
+  // 自动分配
   document.getElementById('detailAutoAssign').onclick = () => {
     autoAssignSingleTask(t);
     saveTasks(tasks);
     renderAll();
     showTaskDetail(id);
-    toast('已为该任务执行自动分配');
+    toast('Auto assignment completed for this task');
   };
   
-  // 删除按钮
+  // 删除任务
   document.getElementById('detailDelete').onclick = () => { closeDetail(); deleteTask(id); };
   
   // 添加子任务
   document.getElementById('addSubBtn').onclick = () => addSubtask(id);
   
-  // 子任务 checkbox
+  // 子任务checkbox
   document.querySelectorAll('.sub-check').forEach(cb => {
     cb.onchange = (e) => toggleSubtask(e.target.dataset.tid, e.target.dataset.sid, e.target.checked);
   });
   
-  // 子任务删除
+  // 子任务删除按钮
   document.querySelectorAll('.sub-rm').forEach(btn => {
     btn.onclick = (e) => { e.stopPropagation(); removeSubtask(btn.dataset.tid, btn.dataset.sid); };
   });
   
-  // 子任务切块按钮
+  // 子任务拆分按钮
   document.querySelectorAll('.sub-chunk-btn').forEach(btn => {
     btn.onclick = (e) => { e.stopPropagation(); chunkSubtaskIntoSessions(btn.dataset.tid, btn.dataset.sid); };
   });
   
-  // 子任务拖动排序
+  // 子任务拖拽
   setupSubtaskDrag(t);
   
   // ---- 拆分功能绑定 ----
@@ -1049,7 +1385,7 @@ function showTaskDetail(id) {
   document.getElementById('detailMask').onclick = closeDetail;
 }
 
-/** 子任务列表拖动排序设置 */
+/** 子任务列表拖拽设置 */
 function setupSubtaskDrag(task) {
   const listEl = document.getElementById('detailSubList');
   if (!listEl) return;
@@ -1108,7 +1444,7 @@ function closeDetail() {
 }
 
 // ======== Detail Panel Split Functions ========
-/** AI智能拆分（集成在详情页，先展示结果等待用户确认） */
+/** AI智能拆分，将任务拆分为多个子任务 */
 async function doAISplit(id) {
   const t = tasks.find(x => x.id === id);
   const btn = document.getElementById('detailAISplitBtn');
@@ -1119,16 +1455,17 @@ async function doAISplit(id) {
   try {
     const result = await parseTaskWithAI(t.title);
     if (result && result.subtasks && result.subtasks.length > 0) {
-      showSplitPreview(result.subtasks);
-      toast('AI 拆分完成，请确认后应用', 'success');
+      const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
+      showSplitPreview(adjustedSubtasks);
+      toast('AI split completed, please review and apply', 'success');
     } else {
       showSplitPreview(getTemplateSplit(t));
-      toast('AI 未返回结果，使用默认模板', 'info');
+      toast('AI returned no split result, using template', 'info');
     }
   } catch (err) {
     console.error('AI 拆分失败:', err);
     showSplitPreview(getTemplateSplit(t));
-    toast('AI 拆分失败，使用默认模板', 'error');
+    toast('AI split failed, using template', 'error');
   } finally {
     btn.textContent = originalText;
     btn.disabled = false;
@@ -1139,20 +1476,20 @@ async function doAISplit(id) {
 function getTemplateSplit(t) {
   const total = parseFloat(document.getElementById('detailSplitHours')?.value) || totalHours(t) || 8;
   const templates = {
-    '论文': ['文献综述', '撰写初稿', '修改完善', '格式排版'],
-    '报告': ['资料收集', '大纲规划', '内容撰写', '审核修改'],
-    '学习': ['预习概览', '深度学习', '练习巩固', '总结复习'],
-    '项目': ['需求分析', '方案设计', '开发实现', '测试部署']
+    paper: ['Literature review', 'Draft writing', 'Revision', 'Formatting'],
+    report: ['Collect materials', 'Outline', 'Write content', 'Review'],
+    study: ['Preview', 'Deep study', 'Practice', 'Summary'],
+    project: ['Requirement analysis', 'Solution design', 'Implementation', 'Testing']
   };
-  let titles = ['阶段一', '阶段二', '阶段三', '阶段四'];
+  let titles = ['Phase 1', 'Phase 2', 'Phase 3', 'Phase 4'];
   for (const [k, v] of Object.entries(templates)) {
-    if (t.title.includes(k)) { titles = v; break; }
+    if (String(t.title || '').toLowerCase().includes(k)) { titles = v; break; }
   }
   const per = Math.round(total / titles.length * 10) / 10;
   return titles.map(title => ({ title, estimatedHours: per }));
 }
 
-/** 在详情面板展示拆分预览（等待用户确认） */
+/** 显示拆分预览 */
 function showSplitPreview(subtasks) {
   const container = document.getElementById('detailSplitItems');
   container.innerHTML = subtasks.map((sub, i) => `
@@ -1163,12 +1500,12 @@ function showSplitPreview(subtasks) {
     </div>
   `).join('');
   
-  // 绑定删除
+  // 绑定删除事件
   container.querySelectorAll('.split-rm').forEach(rm => {
     rm.onclick = () => { rm.parentElement.remove(); updateDetailSplitTotal(); };
   });
   
-  // 绑定小时数变化
+  // 绑定小时数变化事件
   container.querySelectorAll('.split-hours-input').forEach(inp => {
     inp.oninput = () => updateDetailSplitTotal();
   });
@@ -1179,7 +1516,7 @@ function showSplitPreview(subtasks) {
   document.getElementById('splitConfirmBar').style.display = 'flex';
 }
 
-/** 在详情面板添加空白拆分项 */
+/** 在详情面板添加新的子任务 */
 function addDetailSplitItem() {
   const container = document.getElementById('detailSplitItems');
   const div = document.createElement('div');
@@ -1194,7 +1531,7 @@ function addDetailSplitItem() {
   updateDetailSplitTotal();
 }
 
-/** 更新详情面板拆分总时间 */
+/** 更新详情面板拆分总时长 */
 function updateDetailSplitTotal() {
   const inputs = document.querySelectorAll('#detailSplitItems .split-hours-input');
   const total = Array.from(inputs).reduce((s, inp) => s + (parseFloat(inp.value) || 0), 0);
@@ -1221,19 +1558,19 @@ function applyDetailSplit(id) {
   t.estimatedHours = subs.reduce((s, x) => s + x.estimatedHours, 0);
   saveTasks(tasks);
   renderAll();
-  toast('拆分已应用');
+  toast('Split applied');
   
-  // 拆分后自动分配（如果设置开启）
+  // 如果设置了拆分后自动分配，则立即进行自动分配
   if (settings.autoAssignAfterSplit && subs.length > 0) {
     setTimeout(() => {
       autoAssignSingleTask(t);
       saveTasks(tasks);
       renderAll();
-      toast('已自动分配');
+      toast('Auto assignment completed');
     }, 300);
   }
   
-  // 刷新详情
+  // 关闭拆分预览
   showTaskDetail(id);
 }
 
@@ -1277,7 +1614,7 @@ function saveTask() {
   const urgency = parseInt(document.getElementById('fUrgency').value) || 3;
   const notes = document.getElementById('fNotes').value.trim();
   
-  if (!title) { toast('请输入标题', 'error'); return; }
+  if (!title) { toast('Please enter a title', 'error'); return; }
   
   const quadrant = calcQuadrant({ urgency, importance });
   
@@ -1298,7 +1635,7 @@ function saveTask() {
   saveTasks(tasks);
   closeTaskModal();
   renderAll();
-  toast(id ? '任务已更新' : '任务已创建');
+  toast(id ? 'Task updated' : 'Task created');
 }
 
 function completeTask(id) {
@@ -1309,17 +1646,17 @@ function completeTask(id) {
     saveTasks(tasks);
     closeDetail();
     renderAll();
-    toast('任务已完成');
+    toast('Task completed');
   }
 }
 
 function deleteTask(id) {
-  showConfirm('删除任务', '确定删除此任务？', () => {
+  showConfirm('删除任务', '确认删除此任务吗？', () => {
     tasks = tasks.filter(x => x.id !== id);
     saveTasks(tasks);
     selectedTaskId = null;
     renderAll();
-    toast('已删除');
+    toast('Task deleted');
   });
 }
 
@@ -1331,7 +1668,7 @@ function restoreTask(id) {
     saveTasks(tasks);
     closeDetail();
     renderAll();
-    toast('任务已恢复');
+    toast('Task restored');
   }
 }
 
@@ -1342,14 +1679,14 @@ function restoreTask(id) {
 //   if (s) {
 //     s.completed = completed;
 
-//     // 完成时若尚未记录实际耗时，弹窗询问
+//     //
 //     if (completed && s.actualMin == null) {
-//       const raw = prompt('实际花费分钟数（可空跳过）');
+//       const raw = prompt('Actual minutes spent (optional)');
 //       if (raw !== null && raw.trim() !== '') {
 //         const minutes = parseFloat(raw);
 //         if (!isNaN(minutes) && minutes >= 0) {
 //           s.actualMin   = minutes;
-//           s.actualHours = Math.round(minutes / 60 * 10) / 10; // 保留 1 位小数
+//           s.actualHours = Math.round(minutes / 60 * 10) / 10; // 淇濈暀 1 浣嶅皬鏁?
 //         }
 //       }
 //     }
@@ -1368,16 +1705,16 @@ function toggleSubtask(tid, sid, completed) {
 
   s.completed = completed;
 
-  // 完成时若尚未记录实际耗时，弹窗询问
+  // 如果标记为完成且尚未设置实际耗时，则提示输入实际耗时
   if (completed === true && (s.actualMin === null || s.actualMin === undefined)) {
-    const raw = prompt('实际花费分钟数（可空跳过）');
+    const raw = prompt('Actual minutes spent (optional)');
     if (raw !== null) {
       const txt = String(raw).trim();
       if (txt !== '') {
         const minutes = parseFloat(txt);
         if (!Number.isNaN(minutes) && minutes >= 0) {
           s.actualMin = minutes;
-          s.actualHours = Math.round((minutes / 60) * 10) / 10; // 1 位小数
+          s.actualHours = Math.round((minutes / 60) * 10) / 10; // 保留一位小数
         }
       }
     }
@@ -1406,7 +1743,7 @@ function addSubtask(tid) {
   saveTasks(tasks);
   renderAll();
   if (selectedTaskId === tid) showTaskDetail(tid);
-  // 保持输入框聚焦
+  // 添加后清空输入框并聚焦，方便连续添加
   setTimeout(() => {
     const input = document.getElementById('newSubTitle');
     if (input) { input.value = ''; input.focus(); }
@@ -1419,36 +1756,37 @@ async function openSplitModal(id) {
   const t = tasks.find(x => x.id === id);
   
   const btn = document.getElementById('detailSplit');
-  const originalText = btn ? btn.textContent : '拆分';
+  const originalText = btn ? btn.textContent : '加载中...';// 如果有按钮元素，显示加载状态
   if (btn) btn.textContent = 'AI拆分中...';
   
   try {
     const result = await parseTaskWithAI(t.title);
     if (result && result.subtasks && result.subtasks.length > 0) {
+      const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
       const splitItems = document.getElementById('splitItems');
-      splitItems.innerHTML = result.subtasks.map((sub, i) => `
+      splitItems.innerHTML = adjustedSubtasks.map((sub, i) => `
         <div class="split-item">
           <input type="text" value="${esc(sub.title)}" class="split-title-input">
           <input type="number" value="${sub.estimatedHours || 2}" min="0.5" step="0.5" class="split-hours-input">
           <span class="split-rm" onclick="this.parentElement.remove()">&#10005;</span>
         </div>
       `).join('');
-      const totalH = result.subtasks.reduce((sum, s) => sum + (s.estimatedHours || 2), 0);
+      const totalH = adjustedSubtasks.reduce((sum, s) => sum + (s.estimatedHours || 2), 0);
       document.getElementById('splitTotalHours').value = totalH;
       updateSplitTotal();
-      toast('AI 拆分完成，请确认后应用', 'success');
+      toast('AI split completed, please review and apply', 'success');
     } else {
       const hours = totalHours(t) || 8;
       document.getElementById('splitTotalHours').value = hours;
       regenerateSplit();
-      toast('AI 拆分未返回结果，使用默认模板', 'info');
+      toast('AI returned no split result, using template', 'info');
     }
   } catch (err) {
     console.error('AI 拆分失败:', err);
     const hours = totalHours(t) || 8;
     document.getElementById('splitTotalHours').value = hours;
     regenerateSplit();
-    toast('AI 拆分失败，使用默认模板', 'error');
+    toast('AI split failed, using template', 'error');
   } finally {
     if (btn) btn.textContent = originalText;
   }
@@ -1503,111 +1841,102 @@ function applySplit() {
   saveTasks(tasks);
   closeSplit();
   renderAll();
-  toast('拆分已应用');
+  toast('Split applied');
   
-  // 拆分后自动分配：对具体任务执行
+  // 如果设置了拆分后自动分配，则立即进行自动分配
   if (settings.autoAssignAfterSplit && subs.length > 0) {
     setTimeout(() => {
       autoAssignSingleTask(t);
       saveTasks(tasks);
       renderAll();
-      toast('已自动分配');
+      toast('Auto assignment completed');
     }, 300);
   }
 }
 
 // ======== Auto Assign ========
-/** 全局自动分配：处理所有任务（包括无截止日期的任务） */
+/** 自动分配所有未分配的任务 */
 function autoAssign() {
   const active = tasks.filter(t => t.status === 'active');
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const slots = {};
-  for (let i = 0; i < 30; i++) {
-    const d = new Date(today); d.setDate(d.getDate() + i);
-    slots[fmtDate(d)] = settings.dailyWorkHours;
+  if (!active.length) {
+    toast('没有可分配的任务', 'info');
+    return;
   }
-  
-  // 减去已分配的小时数
-  active.forEach(t => {
-    if (t.assignedDays) {
-      Object.entries(t.assignedDays).forEach(([ds, info]) => {
-        const hours = typeof info === 'number' ? info : (info.hours || 0);
-        if (slots[ds] !== undefined) slots[ds] -= hours;
-      });
-    }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const weeklySlots = getActiveWeeklyAvailabilitySlots();
+  const usedByDate = getUsedHoursByDate(active);
+  const capacitySlots = buildCapacitySlots({
+    startDate: today,
+    maxDays: 30,
+    weeklySlots,
+    usedHoursByDate: usedByDate,
+    fallbackDailyHours: settings.dailyWorkHours || 4
   });
-  
+
+  if (!capacitySlots.length) {
+    toast('No available slot for auto assignment', 'warning');
+    return;
+  }
+
   const sorted = [...active].sort((a, b) => calcPriority(b) - calcPriority(a));
-  const warns = [];
-  
-  sorted.forEach(t => {
-    // 收集已手动分配的子任务ID
+  const warns = new Set();
+  const multiplier = getEstimateMultiplier();
+
+  sorted.forEach(task => {
     const manuallyAssignedSubIds = new Set();
-    if (t.assignedDays) {
-      Object.entries(t.assignedDays).forEach(([ds, info]) => {
+    if (task.assignedDays) {
+      Object.entries(task.assignedDays).forEach(([, info]) => {
         if (typeof info === 'object' && info.subtaskIds) {
           info.subtaskIds.forEach(id => manuallyAssignedSubIds.add(id));
         }
       });
     }
-    // 检查子任务上的手动分配标记
-    t.subtasks.forEach(s => {
-      if (s._manuallyAssigned) manuallyAssignedSubIds.add(s.id);
+
+    task.subtasks.forEach(sub => {
+      if (sub._manuallyAssigned) manuallyAssignedSubIds.add(sub.id);
     });
-    
-    // 只处理未手动分配且未完成的子任务
-    let items = t.subtasks.filter(s => !s.completed && !manuallyAssignedSubIds.has(s.id));
+
+    let items = task.subtasks.filter(sub => !sub.completed && !manuallyAssignedSubIds.has(sub.id));
     if (!items.length) {
-      // 如果没有子任务，尝试分配整个任务本身
-      if (t.subtasks.length === 0 && !hasAnyAssignment(t)) {
-        items = [{ id: '__whole_' + t.id, title: t.title, estimatedHours: t.estimatedHours || 1 }];
+      if (task.subtasks.length === 0 && !hasAnyAssignment(task)) {
+        items = [{ id: '__whole_' + task.id, title: task.title, estimatedHours: task.estimatedHours || 1 }];
       } else {
         return;
       }
     }
-    
-    // 获取分配截止日期范围
-    const assignmentDeadline = getAssignmentDeadline(t, today, slots);
-    if (!t.assignedDays) t.assignedDays = {};
-    
+
+    items = applyEstimateMultiplierToWholeTaskItems(items, multiplier);
+    items = interleaveSubtasksByGroup(items);
+    const assignmentDeadline = getAssignmentDeadline(task, today, {});
+    if (!task.assignedDays) task.assignedDays = {};
+
+    const slotGroupState = new Map();
     items.forEach(sub => {
-      let placed = false;
-      for (const ds of Object.keys(slots).sort()) {
-        if (assignmentDeadline && new Date(ds) > assignmentDeadline) break;
-        if (slots[ds] >= (sub.estimatedHours || 1) || slots[ds] >= 0.5) {
-          if (!t.assignedDays[ds]) {
-            t.assignedDays[ds] = { subtaskIds: [], hours: 0 };
-          }
-          let dayData = t.assignedDays[ds];
-          // 兼容数字格式转为对象格式
-          if (typeof dayData === 'number') {
-            t.assignedDays[ds] = { subtaskIds: ['__whole_' + t.id], hours: dayData };
-            dayData = t.assignedDays[ds];
-          }
-          dayData.subtaskIds.push(sub.id);
-          dayData.hours += sub.estimatedHours || 1;
-          slots[ds] -= sub.estimatedHours || 1;
-          placed = true;
-          break;
-        }
-      }
-      if (!placed) warns.push(t.title);
+      const placed = assignSubtaskToCapacitySlots(
+        task,
+        sub,
+        capacitySlots,
+        assignmentDeadline,
+        slotGroupState
+      );
+      if (!placed) warns.add(task.title);
     });
   });
-  
+
   saveTasks(tasks);
   renderAll();
-  if (warns.length) toast('部分任务可能无法按时完成', 'warning');
-  else toast('任务已自动分配');
+  if (warns.size) toast('部分任务可能无法按时完成', 'warning');
+  else toast('Tasks auto assigned');
 }
 
-/** 检查任务是否已有任何分配 */
 function hasAnyAssignment(task) {
   if (!task.assignedDays) return false;
   return Object.keys(task.assignedDays).length > 0;
 }
 
-/** 获取任务的分配截止日期，无截止日期的任务分配到本周末 */
+/** 获取任务的分配截止日期，优先使用任务的deadline，如果没有则根据象限和当前日期计算 */
 function getAssignmentDeadline(task, today, slots) {
   if (task.deadline) {
     const dl = new Date(task.deadline);
@@ -1615,37 +1944,36 @@ function getAssignmentDeadline(task, today, slots) {
     return dl;
   }
   
-  // 无截止日期的任务：根据四象限分配
-  // Q2(重要不紧急)和Q4(不重要不紧急)分配到本周末或低负载日
+  // Q1(重要且紧急)的截止日期为本周末，Q3(不重要但紧急)的截止日期为下周末，其他象限的截止日期为两周后
+  // 计算本周的开始和结束日期
   const weekStart = getWeekStart(today);
   const weekEnd = new Date(weekStart);
-  weekEnd.setDate(weekEnd.getDate() + 7); // 本周结束
+  weekEnd.setDate(weekEnd.getDate() + 7); // 下周末
   
-  // 对于不紧急的任务，优先分配到周末
+  // 对于Q1和Q3，截止日期为本周末或下周末
   if (task.eisenhowerQuadrant === 'Q2' || task.eisenhowerQuadrant === 'Q4') {
-    // 找周末（周六周日）
+    // 计算本周末的日期（周六或周日）
     const saturday = new Date(weekStart);
     saturday.setDate(saturday.getDate() + 5);
     const sunday = new Date(weekStart);
     sunday.setDate(sunday.getDate() + 6);
     
-    // 返回周日作为截止
+    // 如果本周末的slot已经满了，则截止日期为下周末
     return sunday;
   }
   
-  // 其他情况返回两周后
+  // 对于Q1和Q3，截止日期为两周后
   const twoWeeks = new Date(today);
   twoWeeks.setDate(twoWeeks.getDate() + 14);
   return twoWeeks;
 }
 
-/** 单任务自动分配：处理单个任务（支持无截止日期） */
+/** 自动分配单个任务 */
 function autoAssignSingleTask(task) {
-  const dailyHours = settings.dailyWorkHours || 4;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  
-  // 收集已手动分配的子任务ID
+  const multiplier = getEstimateMultiplier();
+
   const manuallyAssignedSubIds = new Set();
   if (task.assignedDays) {
     Object.values(task.assignedDays).forEach(info => {
@@ -1654,86 +1982,94 @@ function autoAssignSingleTask(task) {
       }
     });
   }
-  task.subtasks.forEach(s => {
-    if (s._manuallyAssigned) manuallyAssignedSubIds.add(s.id);
+  task.subtasks.forEach(sub => {
+    if (sub._manuallyAssigned) manuallyAssignedSubIds.add(sub.id);
   });
-  
-  // 获取待分配的项目
-  let items = task.subtasks.filter(s => !s.completed && !manuallyAssignedSubIds.has(s.id));
+
+  let items = task.subtasks.filter(sub => !sub.completed && !manuallyAssignedSubIds.has(sub.id));
   if (!items.length && task.subtasks.length === 0 && !hasAnyAssignment(task)) {
-    // 没有子任务，分配整个任务
     items = [{ id: '__whole_' + task.id, title: task.title, estimatedHours: task.estimatedHours || 1 }];
   }
   if (!items.length) {
-    toast('没有需要分配的子任务', 'info');
+    toast('No subtasks need assignment', 'info');
     return;
   }
-  
-  // 获取分配截止日期
+
+  items = applyEstimateMultiplierToWholeTaskItems(items, multiplier);
+  items = interleaveSubtasksByGroup(items);
   const assignmentDeadline = getAssignmentDeadline(task, today, {});
-  
-  // 构建可用时间槽
-  const slots = {};
-  for (let i = 0; i < 30; i++) {
-    const d = new Date(today); d.setDate(d.getDate() + i);
-    if (assignmentDeadline && d > assignmentDeadline) break;
-    const ds = fmtDate(d);
-    const existing = task.assignedDays?.[ds];
-    const used = typeof existing === 'number' ? existing : (existing?.hours || 0);
-    slots[ds] = dailyHours - used;
+
+  const active = tasks.filter(t => t.status === 'active');
+  const weeklySlots = getActiveWeeklyAvailabilitySlots();
+  const usedByDate = getUsedHoursByDate(active);
+  const capacitySlots = buildCapacitySlots({
+    startDate: today,
+    assignmentDeadline,
+    maxDays: 30,
+    weeklySlots,
+    usedHoursByDate: usedByDate,
+    fallbackDailyHours: settings.dailyWorkHours || 4
+  });
+
+  if (!capacitySlots.length) {
+    toast('No available slot for auto assignment', 'warning');
+    return;
   }
-  
+
   if (!task.assignedDays) task.assignedDays = {};
-  
-  for (const sub of items) {
-    let remaining = sub.estimatedHours || 1;
-    
-    for (const ds of Object.keys(slots).sort()) {
-      if (remaining <= 0) break;
-      if (slots[ds] <= 0) continue;
-      
-      const assign = Math.min(remaining, slots[ds]);
-      
-      if (!task.assignedDays[ds]) {
-        task.assignedDays[ds] = { subtaskIds: [], hours: 0 };
-      }
-      let dayData = task.assignedDays[ds];
-      if (typeof dayData === 'number') {
-        task.assignedDays[ds] = { subtaskIds: ['__whole_' + task.id], hours: dayData };
-        dayData = task.assignedDays[ds];
-      }
-      if (!dayData.subtaskIds.includes(sub.id)) {
-        dayData.subtaskIds.push(sub.id);
-      }
-      dayData.hours += assign;
-      slots[ds] -= assign;
-      remaining -= assign;
-    }
-  }
+
+  const slotGroupState = new Map();
+  let hasUnplaced = false;
+  items.forEach(sub => {
+    const placed = assignSubtaskToCapacitySlots(
+      task,
+      sub,
+      capacitySlots,
+      assignmentDeadline,
+      slotGroupState
+    );
+    if (!placed) hasUnplaced = true;
+  });
+
+  if (hasUnplaced) toast('Some subtasks could not be fully assigned', 'warning');
 }
 
 // ======== AI ========
-/** 处理AI输入：解析后先展示预览，用户确认后才创建 */
+/** 处理AI输入 */
 async function handleAI() {
   const input = document.getElementById('aiInput');
   const text = input.value.trim();
   if (!text) return;
   
   const status = document.getElementById('aiStatus');
-  status.textContent = '解析中...';
+  status.textContent = '解析中..';
   
   try {
     const result = await parseTaskWithAI(text);
     status.textContent = '';
-    // 改为展示预览，而不是直接创建
-    showAIPreview(result);
+    const adjustedResult = {
+      ...result,
+      subtasks: adjustSubtasksForEstimate(result.subtasks || [])
+    };
+    adjustedResult.estimatedHours =
+      adjustedResult.subtasks.reduce((sum, s) => sum + (s.estimatedHours || 0), 0) ||
+      result.estimatedHours ||
+      0;
+    showAIPreview(adjustedResult);
   } catch (e) {
     status.textContent = '';
     toast('AI 解析失败: ' + e.message, 'error');
     const parsed = parseLocal(text);
     if (parsed) {
-      // 同样展示预览
-      showAIPreview(parsed);
+      const adjustedParsed = {
+        ...parsed,
+        subtasks: adjustSubtasksForEstimate(parsed.subtasks || [])
+      };
+      adjustedParsed.estimatedHours =
+        adjustedParsed.subtasks.reduce((sum, s) => sum + (s.estimatedHours || 0), 0) ||
+        parsed.estimatedHours ||
+        0;
+      showAIPreview(adjustedParsed);
     }
   }
 }
@@ -1741,25 +2077,42 @@ async function handleAI() {
 function parseLocal(text) {
   let deadline = null;
   const todayD = new Date();
-  const m1 = text.match(/(\d+)\s*天/);
-  if (m1) { const d = new Date(todayD); d.setDate(d.getDate() + parseInt(m1[1])); deadline = fmtDate(d); }
-  if (/明天/.test(text)) { const d = new Date(todayD); d.setDate(d.getDate() + 1); deadline = fmtDate(d); }
-  if (/后天/.test(text)) { const d = new Date(todayD); d.setDate(d.getDate() + 2); deadline = fmtDate(d); }
-  if (/下周/.test(text)) { const d = new Date(todayD); d.setDate(d.getDate() + 7); deadline = fmtDate(d); }
+  const mDays = text.match(/(\d+)\s*(days?|d)/i);
+  if (mDays) {
+    const d = new Date(todayD);
+    d.setDate(d.getDate() + parseInt(mDays[1], 10));
+    deadline = fmtDate(d);
+  }
+  if (/tomorrow/i.test(text)) {
+    const d = new Date(todayD);
+    d.setDate(d.getDate() + 1);
+    deadline = fmtDate(d);
+  }
+  if (/day after tomorrow/i.test(text)) {
+    const d = new Date(todayD);
+    d.setDate(d.getDate() + 2);
+    deadline = fmtDate(d);
+  }
+  if (/next week/i.test(text)) {
+    const d = new Date(todayD);
+    d.setDate(d.getDate() + 7);
+    deadline = fmtDate(d);
+  }
   const mDate = text.match(/(\d{1,2})[/\-.](\d{1,2})/);
-  if (mDate && !deadline) { deadline = todayD.getFullYear() + '-' + mDate[1].padStart(2, '0') + '-' + mDate[2].padStart(2, '0'); }
-  // 没有匹配到日期关键词则不设截止日期
-  
-  let title = text.replace(/(\d+天后?|明天|后天|下周|给自己|时间|截止|之前|之内|以内|，|。)/g, '').trim();
-  if (!title) title = text.slice(0, 20);
-  
+  if (mDate && !deadline) {
+    deadline = `${todayD.getFullYear()}-${mDate[1].padStart(2, '0')}-${mDate[2].padStart(2, '0')}`;
+  }
+
+  let title = text.trim();
+  if (!title) title = 'Untitled task';
+
   const daysLeft = deadline ? Math.round((new Date(deadline) - todayD) / 864e5) : 7;
-  let urgency = daysLeft <= 1 ? 5 : daysLeft <= 3 ? 4 : daysLeft <= 7 ? 3 : daysLeft <= 14 ? 2 : 1;
-  
-  return { title, deadline, urgency, importance: 3, estimatedHours: 6, subtasks: [], reasoning: '关键词解析' };
+  const urgency = daysLeft <= 1 ? 5 : daysLeft <= 3 ? 4 : daysLeft <= 7 ? 3 : daysLeft <= 14 ? 2 : 1;
+
+  return { title, deadline, urgency, importance: 3, estimatedHours: 6, subtasks: [], reasoning: 'Keyword parsing' };
 }
 
-/** 显示AI解析预览，用户确认后才创建任务 */
+/** 显示AI解析结果预览 */
 function showAIPreview(data) {
   const el = document.getElementById('aiPreview');
   let subsHtml = data.subtasks && data.subtasks.length ? data.subtasks.map((s, i) => `
@@ -1768,16 +2121,16 @@ function showAIPreview(data) {
       <input type="number" class="ai-sub-hours" data-idx="${i}" value="${s.estimatedHours}" min="0.5" step="0.5" style="width:60px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);font-size:12px;">
       <span style="color:var(--text-3);font-size:11px;">h</span>
     </div>
-  `).join('') : '<div class="ai-sub-item" style="color:var(--text-4)">无子任务建议</div>';
+  `).join('') : '<div class="ai-sub-item" style="color:var(--text-4)">没有子任务建议</div>';
   
   el.innerHTML = `<h4>任务解析结果</h4>
     <div class="ai-field"><span class="af-label">标题</span><input type="text" id="aiEditTitle" class="af-val" value="${esc(data.title)}" style="background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);flex:1;"></div>
     <div class="ai-field"><span class="af-label">截止</span><input type="date" id="aiEditDeadline" class="af-val" value="${data.deadline || ''}" style="background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"></div>
-    <div class="ai-field"><span class="af-label">紧急</span><input type="number" id="aiEditUrgency" class="af-val" value="${data.urgency}" min="1" max="5" style="width:60px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"></div>
-    <div class="ai-field"><span class="af-label">重要</span><input type="number" id="aiEditImportance" class="af-val" value="${data.importance}" min="1" max="5" style="width:60px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"></div>
-    <div class="ai-field"><span class="af-label">预估</span><input type="number" id="aiEditHours" class="af-val" value="${data.estimatedHours}" min="0.5" step="0.5" style="width:80px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"><span style="margin-left:4px;color:var(--text-3);">h</span></div>
+    <div class="ai-field"><span class="af-label">紧急程度</span><input type="number" id="aiEditUrgency" class="af-val" value="${data.urgency}" min="1" max="5" style="width:60px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"></div>
+    <div class="ai-field"><span class="af-label">重要性</span><input type="number" id="aiEditImportance" class="af-val" value="${data.importance}" min="1" max="5" style="width:60px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"></div>
+    <div class="ai-field"><span class="af-label">预计时间</span><input type="number" id="aiEditHours" class="af-val" value="${data.estimatedHours}" min="0.5" step="0.5" style="width:80px;background:var(--bg-3);border:1px solid var(--border-1);padding:4px 8px;border-radius:4px;color:var(--text-1);"><span style="margin-left:4px;color:var(--text-3);">h</span></div>
     <div class="ai-subs" style="margin:10px 0;padding:8px;background:var(--bg-2);border-radius:6px;">
-      <div style="font-size:11px;color:var(--text-3);margin-bottom:6px;">子任务 (可编辑)</div>
+      <div style="font-size:11px;color:var(--text-3);margin-bottom:6px;">子任务建议（可编辑）</div>
       ${subsHtml}
     </div>
     <div class="ai-preview-actions">
@@ -1796,7 +2149,7 @@ function closeAIPreview() {
   document.getElementById('aiPreview').classList.remove('open');
 }
 
-/** 从AI预览创建任务（用户点击确认后） */
+/** 从AI解析结果创建任务 */
 function createFromAI() {
   const el = document.getElementById('aiPreview');
   const originalData = el._data; if (!originalData) return;
@@ -1807,7 +2160,7 @@ function createFromAI() {
   const importance = parseInt(document.getElementById('aiEditImportance').value) || 3;
   const estimatedHours = parseFloat(document.getElementById('aiEditHours').value) || 2;
   
-  if (!title) { toast('请输入标题', 'error'); return; }
+  if (!title) { toast('Please enter a title', 'error'); return; }
   
   const subs = [];
   document.querySelectorAll('.ai-sub-title').forEach(input => {
@@ -1834,24 +2187,78 @@ function createFromAI() {
   closeAIPreview();
   document.getElementById('aiInput').value = '';
   renderAll();
-  toast('任务已创建');
+  toast('Task created');
   
-  // 自动分配（如果有子任务）
+  // 自动分配（如果有多余的子任务）
   if (settings.autoAssignAfterSplit && subs.length) {
     setTimeout(() => {
       autoAssignSingleTask(t);
       saveTasks(tasks);
       renderAll();
-      toast('已自动分配');
+      toast('Auto assignment completed');
     }, 300);
   }
 }
 
 // ======== Settings ========
+function renderWeeklySlotEditor(slots = []) {
+  const container = document.getElementById('sWeeklySlots');
+  const normalized = normalizeWeeklyAvailabilitySlots(slots);
+  if (!normalized.length) {
+    container.innerHTML = '<div class="weekly-slots-empty">未设置每周可用时间，将按默认时间分配任务</div>';
+    return;
+  }
+
+  const dayOptions = WEEKDAY_PICKER.map(day => `<option value="${day.value}">${day.label}</option>`).join('');
+  container.innerHTML = normalized.map(slot => `
+    <div class="weekly-slot-item">
+      <select class="slot-day">${dayOptions}</select>
+      <input type="time" class="slot-start" value="${slot.start}" step="900">
+      <span class="slot-sep">-</span>
+      <input type="time" class="slot-end" value="${slot.end}" step="900">
+      <span class="slot-rm" role="button" title="删除">&times;</span>
+    </div>
+  `).join('');
+
+  container.querySelectorAll('.weekly-slot-item').forEach((row, idx) => {
+    const select = row.querySelector('.slot-day');
+    select.value = String(normalized[idx].dayOfWeek);
+  });
+}
+
+function collectWeeklySlotEditorRows() {
+  const rows = Array.from(document.querySelectorAll('#sWeeklySlots .weekly-slot-item'));
+  return rows.map(row => ({
+    dayOfWeek: Number(row.querySelector('.slot-day')?.value),
+    start: String(row.querySelector('.slot-start')?.value || ''),
+    end: String(row.querySelector('.slot-end')?.value || '')
+  }));
+}
+
+function validateAndNormalizeWeeklySlotsFromEditor() {
+  const rows = collectWeeklySlotEditorRows();
+  for (const row of rows) {
+    const startMin = parseTimeToMinutes(row.start);
+    const endMin = parseTimeToMinutes(row.end);
+    if (startMin == null || endMin == null || endMin <= startMin) {
+      return null;
+    }
+  }
+  return normalizeWeeklyAvailabilitySlots(rows);
+}
+
+function addWeeklySlotRow() {
+  const slots = collectWeeklySlotEditorRows();
+  slots.push({ dayOfWeek: 1, start: '09:00', end: '10:00' });
+  renderWeeklySlotEditor(slots);
+}
+
 function openSettings() {
+  settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
   document.getElementById('sDailyH').value = settings.dailyWorkHours;
   document.getElementById('sSplitT').value = settings.splitThreshold;
   document.getElementById('sAutoAssign').value = String(settings.autoAssignAfterSplit);
+  renderWeeklySlotEditor(settings.weeklyAvailabilitySlots);
   document.getElementById('settingsModal').classList.add('open');
 }
 
@@ -1863,11 +2270,19 @@ function saveSettingsHandler() {
   settings.dailyWorkHours = parseFloat(document.getElementById('sDailyH').value) || 4;
   settings.splitThreshold = parseInt(document.getElementById('sSplitT').value) || 6;
   settings.autoAssignAfterSplit = document.getElementById('sAutoAssign').value === 'true';
+
+  const weeklySlots = validateAndNormalizeWeeklySlotsFromEditor();
+  if (weeklySlots == null) {
+    toast('Please check weekly availability: end time must be after start time', 'error');
+    return;
+  }
+  settings.weeklyAvailabilitySlots = weeklySlots;
+
   saveSettings(settings);
   closeSettingsModal();
-  toast('设置已保存');
+  renderAll();
+  toast('Settings saved');
 }
-
 // ======== Filter ========
 function toggleFilter() {
   const filters = [null, 'Q1', 'Q2', 'Q3', 'Q4'];
@@ -1884,7 +2299,7 @@ function exportData() {
   a.download = 'bugule-backup-' + fmtDate(new Date()) + '.json';
   a.click();
   URL.revokeObjectURL(a.href);
-  toast('已导出');
+  toast('Data exported');
 }
 
 function importData(e) {
@@ -1894,14 +2309,15 @@ function importData(e) {
     try {
       const data = JSON.parse(ev.target.result);
       if (data.tasks && Array.isArray(data.tasks)) {
-        showConfirm('导入数据', '将覆盖当前数据，确定？', () => {
+        showConfirm('Import data', 'This will overwrite current data. Continue?', () => {
           tasks = data.tasks;
           if (data.settings) settings = { ...settings, ...data.settings };
+          settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
           saveTasks(tasks);
           saveSettings(settings);
           migrateTasks();
           renderAll();
-          toast('已导入');
+          toast('Data imported');
         });
       } else toast('无效文件', 'error');
     } catch { toast('解析失败', 'error'); }
@@ -1920,9 +2336,9 @@ function showConfirm(title, msg, cb, okText) {
   const okBtn = document.getElementById('cfmOk');
   okBtn.textContent = okText || '确认';
   okBtn.onclick = () => { 
-    const callback = confirmCb;  // 先保存回调
+    const callback = confirmCb;  // ?
     closeConfirm();  // 关闭对话框（会清空confirmCb）
-    if (callback) callback();  // 执行保存的回调
+    if (callback) callback();  // 执行保存的回调函数
   };
   
   document.getElementById('confirmModal').classList.add('open');
@@ -1982,6 +2398,14 @@ function setupListeners() {
   document.getElementById('taskModalClose').onclick = closeTaskModal;
   document.getElementById('taskModalCancel').onclick = closeTaskModal;
   document.getElementById('taskModalSave').onclick = saveTask;
+  document.getElementById('fTitle').addEventListener('keydown', e => {
+    const input = e.currentTarget;
+    if (e.key === 'Tab' && !e.shiftKey && !input.value.trim()) {
+      e.preventDefault();
+      input.value = '已完成任务';
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  });
   
   // Split modal (backward compat)
   document.getElementById('splitModalClose').onclick = closeSplit;
@@ -1995,6 +2419,15 @@ function setupListeners() {
   document.getElementById('settingsModalClose').onclick = closeSettingsModal;
   document.getElementById('settingsModalCancel').onclick = closeSettingsModal;
   document.getElementById('settingsModalSave').onclick = saveSettingsHandler;
+  document.getElementById('sAddWeeklySlot').onclick = addWeeklySlotRow;
+  document.getElementById('sWeeklySlots').addEventListener('click', e => {
+    if (!e.target.classList.contains('slot-rm')) return;
+    const slots = collectWeeklySlotEditorRows();
+    const index = Array.from(e.currentTarget.querySelectorAll('.slot-rm')).indexOf(e.target);
+    if (index < 0) return;
+    slots.splice(index, 1);
+    renderWeeklySlotEditor(slots);
+  });
   
   // Filter
   document.getElementById('filterBtn').onclick = toggleFilter;
@@ -2050,3 +2483,4 @@ function setupListeners() {
 
 // ======== Start ========
 init();
+
