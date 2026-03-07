@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-03-07T06:59:36.376Z",
+  "generatedAt": "2026-03-07T08:58:46.845Z",
   "baseUrl": "http://127.0.0.1:4173/index.html",
   "total": 10,
   "passed": 10,
@@ -89,9 +89,9 @@
       "pass": true,
       "actual": {
         "afterEmptyTab": {
-          "value": "瀹屾垚璇剧▼璁烘枃",
-          "selectionStart": 9,
-          "selectionEnd": 9
+          "value": "已完成任务",
+          "selectionStart": 5,
+          "selectionEnd": 5
         },
         "afterNonEmptyTab": {
           "value": "custom-title"

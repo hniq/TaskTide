@@ -20,6 +20,8 @@ __pycache__/
 # 日志文件
 *.log
 logs/
+*.png
+
 
 # VS Code配置（个人编辑器设置）
 .vscode/

@@ -1,4 +1,4 @@
-﻿/* ================================================================
+/* ================================================================
    不咕了 - NoProcrastination  |  Main JavaScript
    v2.1 - 修复版：删除重复模块/修复按钮/优化自动分配/AI预览确认
    ================================================================ */
@@ -430,7 +430,7 @@ function renderSidebar() {
   if (sortSelect) sortSelect.value = sortMode;
 
   if (!active.length) {
-    list.innerHTML = '<div class="sidebar-empty">杩樻病鏈変换鍔?br>鐐瑰嚮涓婃柟鎸夐挳鎴栫敤 AI 杈撳叆妗嗗垱寤?/div>';
+    list.innerHTML = '<div class="sidebar-empty">暂无任务</div>';
   } else {
     let html = active.map((t, idx) => {
       const dl = dlText(t.deadline);
@@ -439,7 +439,7 @@ function renderSidebar() {
       const pct = tot ? Math.round(done / tot * 100) : 0;
       
       return `<div class="tcard${selectedTaskId === t.id ? ' selected' : ''}" data-id="${t.id}" data-idx="${idx}" draggable="${sortMode === 'manual' ? 'true' : 'false'}">
-        ${sortMode === 'manual' ? '<span class="tcard-drag" title="鎷栧姩鎺掑簭">&#8942;&#8942;</span>' : ''}
+        ${sortMode === 'manual' ? '<span class="tcard-drag" title="拖拽排序">&#8942;&#8942;</span>' : ''}
         <div class="tcard-top"><span class="tcard-q ${getQClass(t.eisenhowerQuadrant)}"></span><span class="tcard-title">${esc(t.title)}</span></div>
         <div class="tcard-meta"><span class="tcard-dl ${dl.cls}">${dl.text}</span>${tot ? `<span class="tcard-progress"><span class="progress-bar"><span class="progress-fill" style="width:${pct}%"></span></span>${done}/${tot}</span>` : ''}</div>
       </div>`;
@@ -468,8 +468,8 @@ function renderSidebar() {
   allActive.forEach(t => { 
     if (t.assignedDays && t.assignedDays[todayStr]) todayCount++; 
   });
-  document.getElementById('sidebarStats').innerHTML = 
-    `<span>鍏?${allActive.length} 涓换鍔?/span><span>浠婃棩 ${todayCount} 椤?/span><span>宸插畬鎴?${completed.length}</span>`;
+  document.getElementById('sidebarStats').innerHTML =
+  `<span>共 ${allActive.length} 个任务</span><span>今日 ${todayCount} 项</span><span>已完成 ${completed.length}</span>`;
 
   // 更新筛选按钮状态
   const filterBtn = document.getElementById('filterBtn');
@@ -506,7 +506,7 @@ function renderSidebarCompleted() {
   document.getElementById('sidebarCompCount').textContent = completed.length;
   const list = document.getElementById('sidebarCompList');
   if (!completed.length) {
-    list.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--text-4)">鏆傛棤宸插畬鎴愪换鍔?/div>';
+    list.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--text-4)">暂无已完成任务</div>';
     return;
   }
   // 渲染已完成任务列表，显示前20条，并添加恢复和删除按钮
@@ -515,8 +515,8 @@ function renderSidebarCompleted() {
       <span class="comp-q ${getQClass(t.eisenhowerQuadrant)}" style="background:var(--${(t.eisenhowerQuadrant||'q4').toLowerCase()})"></span>
       <span class="comp-name">${esc(t.title)}</span>
       <div class="comp-actions">
-        <button class="comp-restore-btn" data-id="${t.id}" title="鎭㈠浠诲姟">&#8634;</button>
-        <button class="comp-del-btn" data-id="${t.id}" title="鍒犻櫎浠诲姟">&#10005;</button>
+        <button class="comp-restore-btn" data-id="${t.id}" title="恢复任务">&#8634;</button>
+        <button class="comp-del-btn" data-id="${t.id}" title="删除任务">&#10005;</button>
       </div>
     </div>
   `).join('');
@@ -533,7 +533,7 @@ function renderSidebarCompleted() {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const id = btn.dataset.id;
-      showConfirm('鍒犻櫎浠诲姟', '纭畾姘镐箙鍒犻櫎姝や换鍔★紵', () => {
+      showConfirm('删除任务', '确认要删除此任务吗？', () => {
         tasks = tasks.filter(x => x.id !== id);
         saveTasks(tasks);
         renderAll();
@@ -675,7 +675,7 @@ function renderMonth() {
   const active = tasks.filter(t => t.status === 'active');
   const dayMap = buildDayMap(active);
 
-  let html = '<div class="cal-weekdays"><span>涓€</span><span>浜?/span><span>涓?/span><span>鍥?/span><span>浜?/span><span>鍏?/span><span>鏃?/span></div><div class="cal-grid">';
+  let html = '<div class="cal-weekdays"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div><div class="cal-grid">';
 
   const prevMonth = new Date(year, month, 0);
   for (let i = startOffset - 1; i >= 0; i--) {
@@ -756,7 +756,7 @@ function renderWeek() {
           <div class="week-task-parent">${esc(x.task.title)}</div>
           <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
         </div>`;
-        }).join('') : '<div class="week-empty">鏃犱换鍔?/div>'}
+        }).join('') : '<div class="week-empty">暂无任务</div>'}
       </div>
     </div>`;
   }
@@ -974,10 +974,10 @@ function renderPanel() {
   }).length;
   
   document.getElementById('weekStats').innerHTML = `
-    <div class="stat-row"><span class="stat-label">鏈懆浠诲姟</span><span class="stat-val">${weekTasks}</span></div>
-    <div class="stat-row"><span class="stat-label">棰勮宸ユ椂</span><span class="stat-val">${weekHours}h</span></div>
-    <div class="stat-row"><span class="stat-label">姣忔棩骞冲潎</span><span class="stat-val">${(weekHours / 7).toFixed(1)}h</span></div>
-    <div class="stat-row"><span class="stat-label">鏈懆宸插畬鎴?/span><span class="stat-val" style="color:var(--success)">${weekCompleted}</span></div>
+    <div class="stat-row"><span class="stat-label">本周任务</span><span class="stat-val">${weekTasks}</span></div>
+    <div class="stat-row"><span class="stat-label">预计用时</span><span class="stat-val">${weekHours}h</span></div>
+    <div class="stat-row"><span class="stat-label">每日平均</span><span class="stat-val">${(weekHours / 7).toFixed(1)}h</span></div>
+    <div class="stat-row"><span class="stat-label">本周完成</span><span class="stat-val" style="color:var(--success)">${weekCompleted}</span></div>
   `;
 }
 
@@ -1003,7 +1003,7 @@ function formatDuration(hours) {
   if (h >= 1) {
     return Number.isInteger(h) ? `${h}h` : `${parseFloat(h.toFixed(1))}h`;
   }
-  return `${Math.round(h * 60)}鍒嗛挓`;
+  return `${Math.round(h * 60)}分钟`;
 }
 
 /** 从标题中去除类似 "(1/3)" 的会话后缀，返回纯标题 */
@@ -1756,8 +1756,8 @@ async function openSplitModal(id) {
   const t = tasks.find(x => x.id === id);
   
   const btn = document.getElementById('detailSplit');
-  const originalText = btn ? btn.textContent : '鎷嗗垎';
-  if (btn) btn.textContent = 'AI鎷嗗垎涓?..';
+  const originalText = btn ? btn.textContent : '加载中...';// 如果有按钮元素，显示加载状态
+  if (btn) btn.textContent = 'AI拆分中...';
   
   try {
     const result = await parseTaskWithAI(t.title);
