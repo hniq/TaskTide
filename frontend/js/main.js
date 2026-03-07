@@ -385,6 +385,7 @@ function init() {
   viewDate = new Date();
   renderAll();
   setupListeners();
+  registerQAHooks();
 }
 
 /** 迁移任务数据 **/
@@ -1444,6 +1445,180 @@ function closeDetail() {
 }
 
 // ======== Detail Panel Split Functions ========
+const TASK_TYPE_CONFIG = [
+  {
+    id: 'paper',
+    priority: 10,
+    matchers: ['\u8BBA\u6587', /paper/i, /essay/i],
+    subtasks: [
+      { title: '\u6587\u732E\u7EFC\u8FF0', weight: 0.3 },
+      { title: '\u64B0\u5199\u521D\u7A3F', weight: 0.35 },
+      { title: '\u4FEE\u6539\u5B8C\u5584', weight: 0.2 },
+      { title: '\u683C\u5F0F\u6392\u7248', weight: 0.15 }
+    ]
+  },
+  {
+    id: 'study',
+    priority: 20,
+    matchers: ['\u5B66\u4E60', '\u590D\u4E60', '\u5907\u8003', '\u5237\u9898'],
+    subtasks: [
+      { title: '\u9884\u4E60\u6982\u89C8', weight: 0.2 },
+      { title: '\u6DF1\u5EA6\u5B66\u4E60', weight: 0.4 },
+      { title: '\u7EC3\u4E60\u5DE9\u56FA', weight: 0.25 },
+      { title: '\u603B\u7ED3\u590D\u4E60', weight: 0.15 }
+    ]
+  },
+  {
+    id: 'project',
+    priority: 30,
+    matchers: ['\u9879\u76EE', '\u5F00\u53D1', /demo/i, '\u7CFB\u7EDF'],
+    subtasks: [
+      { title: '\u9700\u6C42\u5206\u6790', weight: 0.2 },
+      { title: '\u65B9\u6848\u8BBE\u8BA1', weight: 0.25 },
+      { title: '\u5F00\u53D1\u5B9E\u73B0', weight: 0.4 },
+      { title: '\u6D4B\u8BD5\u90E8\u7F72', weight: 0.15 }
+    ]
+  },
+  {
+    id: 'default',
+    priority: 999,
+    matchers: [],
+    subtasks: [
+      { title: '\u9636\u6BB5 1', weight: 0.35 },
+      { title: '\u9636\u6BB5 2', weight: 0.3 },
+      { title: '\u9636\u6BB5 3', weight: 0.2 },
+      { title: '\u9636\u6BB5 4', weight: 0.15 }
+    ]
+  }
+];
+
+function getSplitTargetHours(task, totalHoursOverride = null) {
+  const override = Number(totalHoursOverride);
+  if (Number.isFinite(override) && override > 0) return override;
+  const safeTask = task || {};
+  const base = Number(totalHours(safeTask)) || Number(safeTask.estimatedHours) || 8;
+  return base > 0 ? base : 8;
+}
+
+function matchesTaskType(title, matcher) {
+  if (typeof matcher === 'string') {
+    return title.toLowerCase().includes(matcher.toLowerCase());
+  }
+  if (matcher instanceof RegExp) {
+    const safeFlags = matcher.flags.replace(/g/g, '');
+    return new RegExp(matcher.source, safeFlags).test(title);
+  }
+  return false;
+}
+
+function detectTaskType(title, config = TASK_TYPE_CONFIG) {
+  if (!Array.isArray(config) || !config.length) return TASK_TYPE_CONFIG[TASK_TYPE_CONFIG.length - 1];
+  const safeTitle = String(title || '').trim();
+  const sorted = [...config].sort((a, b) => (Number(a?.priority) || 0) - (Number(b?.priority) || 0));
+  const defaultType =
+    sorted.find(type => type?.id === 'default') ||
+    sorted[sorted.length - 1] ||
+    TASK_TYPE_CONFIG[TASK_TYPE_CONFIG.length - 1];
+
+  for (const type of sorted) {
+    if (!type || type.id === defaultType.id) continue;
+    if (typeof type.matcherFn === 'function') {
+      try {
+        if (type.matcherFn(safeTitle, type)) return type;
+      } catch (_) {}
+    }
+    const matchers = Array.isArray(type.matchers) ? type.matchers : [];
+    if (matchers.some(matcher => matchesTaskType(safeTitle, matcher))) return type;
+  }
+  return defaultType;
+}
+
+function allocateHoursByWeights(totalHours, templateSubtasks) {
+  const totalUnits = Math.round(Number(totalHours) * 2);
+  const source = Array.isArray(templateSubtasks) ? templateSubtasks : [];
+  const normalized = source
+    .map(item => ({
+      title: String(item?.title || '').trim(),
+      weight: Number(item?.weight)
+    }))
+    .filter(item => item.title);
+
+  if (!normalized.length || totalUnits <= 0) return [];
+
+  const keepCount = Math.min(normalized.length, totalUnits);
+  const kept = normalized.slice(0, keepCount);
+  const units = new Array(keepCount).fill(1);
+  const remainingUnits = totalUnits - keepCount;
+
+  if (remainingUnits > 0) {
+    let weights = kept.map(item => (Number.isFinite(item.weight) && item.weight > 0 ? item.weight : 0));
+    if (weights.every(weight => weight <= 0)) {
+      weights = new Array(keepCount).fill(1);
+    }
+    const weightSum = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+    const rawUnits = weights.map(weight => (weight / weightSum) * remainingUnits);
+    const extraUnits = rawUnits.map(value => Math.floor(value));
+    let unallocated = remainingUnits - extraUnits.reduce((sum, value) => sum + value, 0);
+    const remainders = rawUnits
+      .map((value, idx) => ({ idx, remainder: value - Math.floor(value) }))
+      .sort((a, b) => (b.remainder - a.remainder) || (a.idx - b.idx));
+
+    let pointer = 0;
+    while (unallocated > 0 && remainders.length > 0) {
+      const idx = remainders[pointer % remainders.length].idx;
+      extraUnits[idx] += 1;
+      unallocated -= 1;
+      pointer += 1;
+    }
+
+    for (let i = 0; i < keepCount; i++) {
+      units[i] += extraUnits[i];
+    }
+  }
+
+  return kept.map((item, idx) => ({
+    title: item.title,
+    estimatedHours: units[idx] / 2
+  }));
+}
+
+function isValidAISubtasks(subtasks, totalHours) {
+  const targetHours = Number(totalHours);
+  if (!Array.isArray(subtasks) || subtasks.length < 2) return false;
+  if (!Number.isFinite(targetHours) || targetHours <= 0) return false;
+
+  let aiTotal = 0;
+  for (const sub of subtasks) {
+    const title = String(sub?.title || '').trim();
+    const estimated = Number(sub?.estimatedHours);
+    if (!title) return false;
+    if (!Number.isFinite(estimated) || estimated <= 0) return false;
+    aiTotal += estimated;
+  }
+
+  const ratioDiff = Math.abs(aiTotal - targetHours) / targetHours;
+  return ratioDiff <= 0.4;
+}
+
+function normalizeAISubtasksByTaskType(task, subtasks, totalHours) {
+  const targetHours = getSplitTargetHours(task, totalHours);
+  if (!isValidAISubtasks(subtasks, targetHours)) {
+    return getTemplateSplit(task, targetHours);
+  }
+
+  const normalized = subtasks.map(sub => ({
+    title: String(sub.title || '').trim(),
+    estimatedHours: Number(sub.estimatedHours)
+  }));
+  const aiTotal = normalized.reduce((sum, sub) => sum + sub.estimatedHours, 0);
+  if (Math.abs(aiTotal - targetHours) <= 1e-6) return normalized;
+
+  const proportionalSubtasks = normalized.map(sub => ({
+    title: sub.title,
+    weight: sub.estimatedHours
+  }));
+  return allocateHoursByWeights(targetHours, proportionalSubtasks);
+}
 /** AI智能拆分，将任务拆分为多个子任务 */
 async function doAISplit(id) {
   const t = tasks.find(x => x.id === id);
@@ -1451,20 +1626,29 @@ async function doAISplit(id) {
   const originalText = btn.textContent;
   btn.textContent = 'AI拆分中...';
   btn.disabled = true;
+  const targetHours = getSplitTargetHours(
+    t,
+    parseFloat(document.getElementById('detailSplitHours')?.value)
+  );
   
   try {
     const result = await parseTaskWithAI(t.title);
     if (result && result.subtasks && result.subtasks.length > 0) {
       const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
-      showSplitPreview(adjustedSubtasks);
-      toast('AI split completed, please review and apply', 'success');
+      const aiValid = isValidAISubtasks(adjustedSubtasks, targetHours);
+      const normalizedSubtasks = normalizeAISubtasksByTaskType(t, adjustedSubtasks, targetHours);
+      showSplitPreview(normalizedSubtasks);
+      toast(
+        aiValid ? 'AI split completed, please review and apply' : 'AI split quality is low, using template',
+        aiValid ? 'success' : 'info'
+      );
     } else {
-      showSplitPreview(getTemplateSplit(t));
+      showSplitPreview(getTemplateSplit(t, targetHours));
       toast('AI returned no split result, using template', 'info');
     }
   } catch (err) {
     console.error('AI 拆分失败:', err);
-    showSplitPreview(getTemplateSplit(t));
+    showSplitPreview(getTemplateSplit(t, targetHours));
     toast('AI split failed, using template', 'error');
   } finally {
     btn.textContent = originalText;
@@ -1473,20 +1657,10 @@ async function doAISplit(id) {
 }
 
 /** 获取模板拆分建议 */
-function getTemplateSplit(t) {
-  const total = parseFloat(document.getElementById('detailSplitHours')?.value) || totalHours(t) || 8;
-  const templates = {
-    paper: ['Literature review', 'Draft writing', 'Revision', 'Formatting'],
-    report: ['Collect materials', 'Outline', 'Write content', 'Review'],
-    study: ['Preview', 'Deep study', 'Practice', 'Summary'],
-    project: ['Requirement analysis', 'Solution design', 'Implementation', 'Testing']
-  };
-  let titles = ['Phase 1', 'Phase 2', 'Phase 3', 'Phase 4'];
-  for (const [k, v] of Object.entries(templates)) {
-    if (String(t.title || '').toLowerCase().includes(k)) { titles = v; break; }
-  }
-  const per = Math.round(total / titles.length * 10) / 10;
-  return titles.map(title => ({ title, estimatedHours: per }));
+function getTemplateSplit(t, totalHoursOverride = null) {
+  const taskType = detectTaskType(t?.title, TASK_TYPE_CONFIG);
+  const total = getSplitTargetHours(t, totalHoursOverride);
+  return allocateHoursByWeights(total, taskType.subtasks || []);
 }
 
 /** 显示拆分预览 */
@@ -1754,6 +1928,9 @@ function addSubtask(tid) {
 async function openSplitModal(id) {
   splitTargetId = id;
   const t = tasks.find(x => x.id === id);
+  const splitTotalInput = document.getElementById('splitTotalHours');
+  const initialTotal = getSplitTargetHours(t, totalHours(t) || 8);
+  if (splitTotalInput) splitTotalInput.value = initialTotal;
   
   const btn = document.getElementById('detailSplit');
   const originalText = btn ? btn.textContent : '加载中...';// 如果有按钮元素，显示加载状态
@@ -1761,30 +1938,33 @@ async function openSplitModal(id) {
   
   try {
     const result = await parseTaskWithAI(t.title);
+    const targetHours = getSplitTargetHours(t, parseFloat(splitTotalInput?.value));
     if (result && result.subtasks && result.subtasks.length > 0) {
       const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
+      const aiValid = isValidAISubtasks(adjustedSubtasks, targetHours);
+      const normalizedSubtasks = normalizeAISubtasksByTaskType(t, adjustedSubtasks, targetHours);
       const splitItems = document.getElementById('splitItems');
-      splitItems.innerHTML = adjustedSubtasks.map((sub, i) => `
+      splitItems.innerHTML = normalizedSubtasks.map((sub, i) => `
         <div class="split-item">
           <input type="text" value="${esc(sub.title)}" class="split-title-input">
           <input type="number" value="${sub.estimatedHours || 2}" min="0.5" step="0.5" class="split-hours-input">
           <span class="split-rm" onclick="this.parentElement.remove()">&#10005;</span>
         </div>
       `).join('');
-      const totalH = adjustedSubtasks.reduce((sum, s) => sum + (s.estimatedHours || 2), 0);
-      document.getElementById('splitTotalHours').value = totalH;
+      if (splitTotalInput) splitTotalInput.value = targetHours;
       updateSplitTotal();
-      toast('AI split completed, please review and apply', 'success');
+      toast(
+        aiValid ? 'AI split completed, please review and apply' : 'AI split quality is low, using template',
+        aiValid ? 'success' : 'info'
+      );
     } else {
-      const hours = totalHours(t) || 8;
-      document.getElementById('splitTotalHours').value = hours;
+      if (splitTotalInput) splitTotalInput.value = targetHours;
       regenerateSplit();
       toast('AI returned no split result, using template', 'info');
     }
   } catch (err) {
     console.error('AI 拆分失败:', err);
-    const hours = totalHours(t) || 8;
-    document.getElementById('splitTotalHours').value = hours;
+    if (splitTotalInput) splitTotalInput.value = getSplitTargetHours(t, parseFloat(splitTotalInput?.value));
     regenerateSplit();
     toast('AI split failed, using template', 'error');
   } finally {
@@ -1802,7 +1982,7 @@ function closeSplit() {
 function regenerateSplit() {
   const total = parseFloat(document.getElementById('splitTotalHours').value) || 8;
   const t = tasks.find(x => x.id === splitTargetId);
-  const subs = getTemplateSplit(t);
+  const subs = getTemplateSplit(t, total);
   document.getElementById('splitItems').innerHTML = subs.map((sub, i) => `
     <div class="split-item">
       <input type="text" value="${sub.title}" class="split-title-input">
@@ -2478,6 +2658,23 @@ function setupListeners() {
       renderSidebar();
       renderPanel();
     }
+  };
+}
+
+function registerQAHooks() {
+  if (window.__TT_QA__ !== true) return;
+
+  window.__TT_QA_openLegacySplitModal = async function(taskId) {
+    return openSplitModal(taskId);
+  };
+
+  window.__TT_QA_regenerateLegacySplit = function(totalHours) {
+    const input = document.getElementById('splitTotalHours');
+    const value = Number(totalHours);
+    if (input && Number.isFinite(value) && value > 0) {
+      input.value = value;
+    }
+    regenerateSplit();
   };
 }
 
