@@ -1,0 +1,108 @@
+{
+  "generatedAt": "2026-03-07T06:59:36.376Z",
+  "baseUrl": "http://127.0.0.1:4173/index.html",
+  "total": 10,
+  "passed": 10,
+  "failed": 0,
+  "results": [
+    {
+      "id": "TC01",
+      "pass": true,
+      "actual": 1,
+      "expected": 1,
+      "note": "no history => 1"
+    },
+    {
+      "id": "TC02",
+      "pass": true,
+      "actual": 1.5,
+      "expected": 1.5,
+      "note": "average ratio"
+    },
+    {
+      "id": "TC03",
+      "pass": true,
+      "actual": 0.7,
+      "expected": 0.7,
+      "note": "clamp min"
+    },
+    {
+      "id": "TC04",
+      "pass": true,
+      "actual": 2.5,
+      "expected": 2.5,
+      "note": "clamp max"
+    },
+    {
+      "id": "TC05",
+      "pass": true,
+      "actual": [
+        3,
+        6
+      ],
+      "expected": [
+        3,
+        6
+      ],
+      "note": "AI subtasks adjusted by multiplier"
+    },
+    {
+      "id": "TC06",
+      "pass": true,
+      "actual": 6,
+      "expected": 6,
+      "note": "whole task auto assign uses multiplier"
+    },
+    {
+      "id": "TC07",
+      "pass": true,
+      "actual": 2,
+      "expected": 2,
+      "note": "subtasks auto assign unchanged"
+    },
+    {
+      "id": "TC08-drag",
+      "pass": true,
+      "actual": {
+        "hasToday": false,
+        "tomorrowHours": 2
+      },
+      "expected": {
+        "hasToday": false,
+        "tomorrowHours": 2
+      },
+      "note": "drag keeps raw hours"
+    },
+    {
+      "id": "TC08-remove",
+      "pass": true,
+      "actual": {
+        "hasTomorrow": false
+      },
+      "expected": {
+        "hasTomorrow": false
+      },
+      "note": "remove does not leave inflated hours"
+    },
+    {
+      "id": "TC09",
+      "pass": true,
+      "actual": {
+        "afterEmptyTab": {
+          "value": "瀹屾垚璇剧▼璁烘枃",
+          "selectionStart": 9,
+          "selectionEnd": 9
+        },
+        "afterNonEmptyTab": {
+          "value": "custom-title"
+        }
+      },
+      "expected": {
+        "emptyFilled": true,
+        "caretAtEnd": true,
+        "preserveNonEmpty": true
+      },
+      "note": "tab quick fill remains and non-empty value is not overridden"
+    }
+  ]
+}
