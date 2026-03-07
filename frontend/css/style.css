@@ -287,6 +287,12 @@ a{color:var(--accent);text-decoration:none}
 .sub-handle{color:var(--text-4);font-size:10px;cursor:grab;flex-shrink:0;user-select:none}
 .sub-check{width:15px;height:15px;accent-color:var(--accent);flex-shrink:0}
 .sub-title{flex:1;font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub-content{display:flex;flex-direction:column;flex:1;min-width:0;overflow:hidden}
+.sub-content .sub-title{flex:none}
+.sub-mini{font-size:10px;color:var(--text-4);white-space:normal;line-height:1.4;margin-top:2px;word-break:break-all}
+.sub-actual{font-size:10px;color:var(--accent);flex-shrink:0;margin-left:2px}
+.sub-chunk-btn{padding:2px 6px;font-size:11px;border:1px solid var(--border-1);border-radius:4px;color:var(--text-3);background:transparent;flex-shrink:0;transition:all var(--dur-fast);cursor:pointer}
+.sub-chunk-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
 .sub-hours{font-size:11px;color:var(--text-3);flex-shrink:0}
 .sub-rm{color:var(--text-4);font-size:13px;flex-shrink:0;opacity:0;transition:opacity var(--dur-fast)}
 .sub-item:hover .sub-rm{opacity:1}
