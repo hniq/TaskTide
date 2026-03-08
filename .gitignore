@@ -9,6 +9,7 @@ env/
 .env.production
 
 # Python缓存文件
+artifacts/*
 __pycache__/
 *.py[cod]
 *$py.class
