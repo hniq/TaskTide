@@ -5,12 +5,12 @@ const modelscopeService = require('../services/modelscope');
 // Parse task using LLM
 router.post('/parse-task', async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, profile, templateInfo } = req.body;
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ error: 'Missing or invalid text parameter' });
     }
 
-    const result = await modelscopeService.parseTask(text);
+    const result = await modelscopeService.parseTask(text, profile, templateInfo);
     res.json(result);
   } catch (error) {
     console.error('Parse task error:', error);

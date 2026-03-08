@@ -9,9 +9,10 @@ easy task1: 统计耗时
 
 import { 
   uid, fmtDate, esc, dlText, calcQuadrant, calcPriority, 
-  getQClass, totalHours, getWeekStart, WEEKDAYS, Q_LABELS, Q_SHORT 
+  getQClass, totalHours, getWeekStart, WEEKDAYS, Q_LABELS, Q_SHORT,
+  USER_PROFILE_OPTIONS, TASK_TEMPLATE_GROUPS, getTemplateForInput
 } from './utils.js';
-import { loadTasks, saveTasks, loadSettings, saveSettings } from './storage.js';
+import { loadTasks, saveTasks, loadSettings, saveSettings, loadProfile, saveProfile } from './storage.js';
 import { parseTaskWithAI, checkAIHealth } from './api.js';
 
 const SLOT_EPSILON = 1e-6;
@@ -537,6 +538,9 @@ function init() {
   viewDate = new Date();
   renderAll();
   setupListeners();
+  setupOnboarding();
+  const profile = loadProfile();
+  if (!profile.completed) showOnboarding();
   registerQAHooks();
 }
 
@@ -882,8 +886,8 @@ function renderMonth() {
   html += '</div>';
   body.innerHTML = html;
   
-  // 绑定日历拖拽事件
   bindCalendarDragEvents();
+  bindDayCellClick();
 }
 
 /** 渲染周视图 */
@@ -947,10 +951,72 @@ function renderWeek() {
   html += '</div>';
   body.innerHTML = html;
   
-  // 
   bindCalendarDragEvents();
-  
   bindWeekTaskDrag();
+  bindDayCellClick();
+}
+
+/** 点击某天放大该日信息，点击空白关闭 */
+function openDayDetail(dateStr) {
+  const active = tasks.filter(t => t.status === 'active');
+  const dayMap = buildDayMap(active);
+  const list = dayMap[dateStr] || [];
+  const d = new Date(dateStr + 'T12:00:00');
+  const titleStr = `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${WEEKDAYS[d.getDay()]}`;
+  document.getElementById('dayDetailTitle').textContent = titleStr;
+  const totalH = list.reduce((s, x) => s + (x.sub.estimatedHours || 0), 0);
+  const container = document.getElementById('dayDetailList');
+  if (!list.length) {
+    container.innerHTML = '<div class="day-detail-empty">当日暂无分配任务</div>';
+  } else {
+    const qOrder = { Q1: 0, Q2: 1, Q3: 2, Q4: 3 };
+    const sorted = [...list].sort((a, b) => (qOrder[a.task.eisenhowerQuadrant] ?? 3) - (qOrder[b.task.eisenhowerQuadrant] ?? 3));
+    container.innerHTML = `<div class="day-detail-summary">共 ${list.length} 项 · 预估 ${totalH.toFixed(1)}h</div>` + sorted.map(x => {
+      const q = getQClass(x.task.eisenhowerQuadrant);
+      const done = x.sub.completed ? ' completed' : '';
+      const hrs = x.sub.estimatedHours != null ? x.sub.estimatedHours : '-';
+      return `<div class="day-detail-item${done}" data-tid="${x.task.id}" data-date="${dateStr}">
+        <span class="q-dot ${q}"></span>
+        <div class="day-detail-item-content">
+          <div class="day-detail-item-title">${esc(x.sub.title)}</div>
+          <div class="day-detail-item-parent">${esc(x.task.title)}</div>
+          <div class="day-detail-item-meta">${hrs}h · ${Q_SHORT[x.task.eisenhowerQuadrant] || 'Q4'}</div>
+        </div>
+      </div>`;
+    }).join('');
+    container.querySelectorAll('.day-detail-item').forEach(el => {
+      el.addEventListener('click', e => {
+        e.stopPropagation();
+        selectTask(el.dataset.tid);
+        closeDayDetail();
+        renderAll();
+        showTaskDetail(el.dataset.tid);
+      });
+    });
+  }
+  document.getElementById('dayDetailMask').classList.add('open');
+  document.getElementById('dayDetailPanel').classList.add('open');
+}
+
+function closeDayDetail() {
+  document.getElementById('dayDetailMask').classList.remove('open');
+  document.getElementById('dayDetailPanel').classList.remove('open');
+}
+
+function bindDayCellClick() {
+  document.querySelectorAll('.cal-cell[data-date]').forEach(cell => {
+    cell.addEventListener('click', () => openDayDetail(cell.dataset.date));
+  });
+  document.querySelectorAll('.week-col[data-date]').forEach(col => {
+    col.addEventListener('click', e => {
+      if (e.target.closest('.week-task-rm')) return;
+      openDayDetail(col.dataset.date);
+    });
+  });
+  const mask = document.getElementById('dayDetailMask');
+  const closeBtn = document.getElementById('dayDetailClose');
+  if (mask && !mask._bound) { mask._bound = true; mask.onclick = closeDayDetail; }
+  if (closeBtn && !closeBtn._bound) { closeBtn._bound = true; closeBtn.onclick = closeDayDetail; }
 }
 
 
@@ -1993,7 +2059,9 @@ async function doAISplit(id) {
   );
   
   try {
-    const result = await parseTaskWithAI(t.title);
+    const profile = loadProfile();
+    const templateInfo = getTemplateForInput(t.title);
+    const result = await parseTaskWithAI(t.title, profile, templateInfo);
     if (result && result.subtasks && result.subtasks.length > 0) {
       const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
       const aiValid = isValidAISubtasks(adjustedSubtasks, targetHours);
@@ -2110,7 +2178,12 @@ function applyDetailSplit(id) {
 }
 
 // ======== Task CRUD ========
+/** 创建待办时若未选过使用目的，先弹出使用目的选择 */
 function openTaskModal(id = null) {
+  if (!id && !loadProfile().purpose) {
+    showPurposeModal(() => { closePurposeModal(); openTaskModal(null); });
+    return;
+  }
   const modal = document.getElementById('taskModal');
   const title = document.getElementById('taskModalTitle');
   const fTitle = document.getElementById('fTitle');
@@ -2321,7 +2394,9 @@ async function openSplitModal(id) {
   if (btn) btn.textContent = 'AI拆分中...';
   
   try {
-    const result = await parseTaskWithAI(t.title);
+    const profile = loadProfile();
+    const templateInfo = getTemplateForInput(t.title);
+    const result = await parseTaskWithAI(t.title, profile, templateInfo);
     const targetHours = getSplitTargetHours(t, parseFloat(splitTotalInput?.value));
     if (result && result.subtasks && result.subtasks.length > 0) {
       const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
@@ -2602,7 +2677,9 @@ async function handleAI() {
   status.textContent = '解析中..';
   
   try {
-    const result = await parseTaskWithAI(text);
+    const profile = loadProfile();
+    const templateInfo = getTemplateForInput(text);
+    const result = await parseTaskWithAI(text, profile, templateInfo);
     status.textContent = '';
     const adjustedResult = {
       ...result,
@@ -2704,6 +2781,49 @@ function showAIPreview(data) {
 
 function closeAIPreview() {
   document.getElementById('aiPreview').classList.remove('open');
+}
+
+// ======== 输入模板（三组写死模板 + 入口 UI） ========
+function toggleTemplatePopover() {
+  const pop = document.getElementById('templatePopover');
+  const btn = document.getElementById('templateBtn');
+  if (pop.classList.contains('open')) {
+    closeTemplatePopover();
+    return;
+  }
+  closeAIPreview();
+  renderTemplatePopover();
+  pop.classList.add('open');
+  btn.classList.add('active');
+}
+
+function closeTemplatePopover() {
+  document.getElementById('templatePopover').classList.remove('open');
+  document.getElementById('templateBtn').classList.remove('active');
+}
+
+function renderTemplatePopover() {
+  const inner = document.getElementById('templatePopoverInner');
+  inner.innerHTML = TASK_TEMPLATE_GROUPS.map((g, gi) => `
+    <div class="template-group">
+      <div class="template-group-name">${esc(g.name)}</div>
+      ${g.templates.map((t, ti) => `<button type="button" class="template-chip" data-g="${gi}" data-t="${ti}">${esc(t.label)}</button>`).join('')}
+    </div>
+  `).join('');
+  inner.querySelectorAll('.template-chip').forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      const gi = parseInt(btn.dataset.g, 10);
+      const ti = parseInt(btn.dataset.t, 10);
+      const group = TASK_TEMPLATE_GROUPS[gi];
+      const text = group?.templates?.[ti]?.text;
+      if (text) {
+        document.getElementById('aiInput').value = text;
+        document.getElementById('aiInput').focus();
+      }
+      closeTemplatePopover();
+    };
+  });
 }
 
 /** 从AI解析结果创建任务 */
@@ -2850,7 +2970,15 @@ function openSettings() {
   document.getElementById('sDailyH').value = settings.dailyWorkHours;
   document.getElementById('sSplitT').value = settings.splitThreshold;
   document.getElementById('sAutoAssign').value = String(settings.autoAssignAfterSplit);
+
   renderWeeklySlotEditor(settings.weeklyAvailability);
+  const profile = loadProfile();
+  const tagsEl = document.getElementById('settingsProfileTags');
+  if (tagsEl) {
+    tagsEl.innerHTML = profile.tags && profile.tags.length
+      ? profile.tags.map(t => `<span>${esc(t)}</span>`).join('')
+      : '暂无';
+  }
   document.getElementById('settingsModal').classList.add('open');
 }
 
@@ -2895,7 +3023,7 @@ function toggleFilter() {
 
 // ======== Export/Import ========
 function exportData() {
-  const blob = new Blob([JSON.stringify({ tasks, settings, exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify({ tasks, settings, profile: loadProfile(), exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'bugule-backup-' + fmtDate(new Date()) + '.json';
@@ -2915,6 +3043,7 @@ function importData(e) {
           tasks = data.tasks;
           if (data.settings) settings = { ...settings, ...data.settings };
           syncWeeklyAvailabilitySettingsObject(settings);
+          if (data.profile && typeof data.profile === 'object') saveProfile(data.profile);
           saveTasks(tasks);
           saveSettings(settings);
           migrateTasks();
@@ -2980,6 +3109,117 @@ function handleSortChange(e) {
   saveSettings(settings);
   renderSidebar();
 }
+
+// ======== 用户画像引导 ========
+// 注册后仅：身份角色、时间管理挑战；使用目的在创建待办时再选
+const ONBOARDING_STEPS = [
+  { key: 'role', title: '你的身份', desc: '选择最符合你的身份角色，AI 将据此为你定制任务拆分建议。' },
+  { key: 'challenge', title: '时间管理挑战', desc: '你目前最大的时间管理困扰是？（可选，帮助 AI 给出更贴合的拆分与建议）' }
+];
+
+let onboardingStepIndex = 0;
+let onboardingDraft = { role: '', purpose: '', challenge: '' };
+
+function setupOnboarding() {
+  document.getElementById('onboardingPrev').onclick = () => { onboardingStepIndex--; renderOnboardingStep(); };
+  document.getElementById('onboardingNext').onclick = () => { onboardingStepIndex++; renderOnboardingStep(); };
+  document.getElementById('onboardingDone').onclick = finishOnboarding;
+  document.getElementById('editProfileBtn').onclick = () => { openOnboardingForEdit(); };
+  // 使用目的弹窗（创建待办时弹出）
+  document.getElementById('purposeModalClose').onclick = closePurposeModal;
+  document.getElementById('purposeModalSkip').onclick = () => { closePurposeModal(); };
+  document.getElementById('purposeModalOk').onclick = confirmPurposeSelection;
+}
+
+let purposeModalCallback = null;
+let selectedPurposeValue = '';
+
+function showPurposeModal(onConfirm) {
+  purposeModalCallback = onConfirm;
+  selectedPurposeValue = loadProfile().purpose || '';
+  const opts = USER_PROFILE_OPTIONS.purpose;
+  const container = document.getElementById('purposeModalOptions');
+  container.innerHTML = opts.map(o => {
+    const selected = selectedPurposeValue === o.value ? ' selected' : '';
+    return `<button type="button" class="onboarding-opt${selected}" data-value="${esc(o.value)}">${esc(o.label)}</button>`;
+  }).join('');
+  container.querySelectorAll('.onboarding-opt').forEach(btn => {
+    btn.onclick = () => {
+      selectedPurposeValue = btn.dataset.value;
+      container.querySelectorAll('.onboarding-opt').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    };
+  });
+  document.getElementById('purposeModal').classList.add('open');
+}
+
+function closePurposeModal() {
+  document.getElementById('purposeModal').classList.remove('open');
+  purposeModalCallback = null;
+}
+
+function confirmPurposeSelection() {
+  if (!selectedPurposeValue) {
+    toast('请先选择使用目的', 'warning');
+    return;
+  }
+  saveProfile({ ...loadProfile(), purpose: selectedPurposeValue });
+  closePurposeModal();
+  if (purposeModalCallback) purposeModalCallback();
+  purposeModalCallback = null;
+  toast('已记录使用目的');
+}
+
+function openOnboardingForEdit() {
+  const profile = loadProfile();
+  onboardingDraft = { role: profile.role || '', purpose: profile.purpose || '', challenge: profile.challenge || '' };
+  onboardingStepIndex = 0;
+  renderOnboardingStep();
+  document.getElementById('settingsModal').classList.remove('open');
+  showOnboarding();
+}
+
+function showOnboarding() {
+  const profile = loadProfile();
+  onboardingDraft = { role: profile.role || '', purpose: profile.purpose || '', challenge: profile.challenge || '' };
+  onboardingStepIndex = 0;
+  renderOnboardingStep();
+  document.getElementById('onboardingModal').classList.add('open');
+}
+
+function closeOnboarding() {
+  document.getElementById('onboardingModal').classList.remove('open');
+}
+
+function renderOnboardingStep() {
+  const step = ONBOARDING_STEPS[onboardingStepIndex];
+  const opts = USER_PROFILE_OPTIONS[step.key];
+  document.getElementById('onboardingTitle').textContent = step.title;
+  document.getElementById('onboardingStep').textContent = `${onboardingStepIndex + 1}/${ONBOARDING_STEPS.length}`;
+  document.getElementById('onboardingDesc').textContent = step.desc;
+  const container = document.getElementById('onboardingOptions');
+  container.innerHTML = opts.map(o => {
+    const selected = onboardingDraft[step.key] === o.value ? ' selected' : '';
+    return `<button type="button" class="onboarding-opt${selected}" data-value="${esc(o.value)}">${esc(o.label)}</button>`;
+  }).join('');
+  container.querySelectorAll('.onboarding-opt').forEach(btn => {
+    btn.onclick = () => {
+      onboardingDraft[step.key] = btn.dataset.value;
+      container.querySelectorAll('.onboarding-opt').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    };
+  });
+  document.getElementById('onboardingPrev').style.visibility = onboardingStepIndex === 0 ? 'hidden' : 'visible';
+  const isLast = onboardingStepIndex === ONBOARDING_STEPS.length - 1;
+  document.getElementById('onboardingNext').style.display = isLast ? 'none' : 'inline-block';
+  document.getElementById('onboardingDone').style.display = isLast ? 'inline-block' : 'none';
+}
+
+function finishOnboarding() {
+  const profile = loadProfile();
+  saveProfile({ role: onboardingDraft.role, challenge: onboardingDraft.challenge, purpose: profile.purpose || '', completed: true });
+  closeOnboarding();
+  toast('画像已保存，AI 拆分将更贴合你的类型');
 
 // ======== Pomodoro Timer ========
 let pomodoroTimer = null;
@@ -3207,6 +3447,13 @@ function setupListeners() {
   // AI
   document.getElementById('aiSendBtn').onclick = handleAI;
   document.getElementById('aiInput').onkeydown = e => { if (e.key === 'Enter') handleAI(); };
+  // 模板入口
+  document.getElementById('templateBtn').onclick = e => {
+    e.stopPropagation();
+    toggleTemplatePopover();
+  };
+  document.addEventListener('click', () => closeTemplatePopover());
+  document.getElementById('templatePopover')?.addEventListener('click', e => e.stopPropagation());
   
   // Export/Import
   document.getElementById('exportBtn').onclick = exportData;
@@ -3271,7 +3518,7 @@ function setupListeners() {
     if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); document.getElementById('aiInput').focus(); }
     if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); openTaskModal(); }
     if (e.key === 'Escape') {
-      closeTaskModal(); closeSplit(); closeSettingsModal(); closeConfirm(); closeAIPreview(); closeDetail();
+      closeTaskModal(); closeSplit(); closeSettingsModal(); closeConfirm(); closeAIPreview(); closeDetail(); closeOnboarding(); closePurposeModal(); closeTemplatePopover(); closeDayDetail();
     }
   };
   

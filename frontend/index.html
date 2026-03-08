@@ -16,10 +16,14 @@
     <span class="logo-tag">让DDL成为第一生产力</span>
   </div>
   <div class="ai-bar">
+    <button class="ai-template-btn" id="templateBtn" type="button" title="常用目标模板">模板</button>
     <input class="ai-input" id="aiInput" placeholder="告诉我你的任务... (Ctrl+K)" autocomplete="off">
     <span class="ai-status" id="aiStatus"></span>
     <button class="ai-send" id="aiSendBtn">&#10148;</button>
     <div class="ai-preview" id="aiPreview"></div>
+    <div class="template-popover" id="templatePopover">
+      <div class="template-popover-inner" id="templatePopoverInner"></div>
+    </div>
   </div>
   <div class="header-actions">
     <button class="hdr-btn today-btn" id="todayBtn" title="今日专注">&#127774; 今日</button>
@@ -107,6 +111,16 @@
   </aside>
 </div>
 
+<!-- 某天放大：点击日历某天显示该日详情，点击空白关闭 -->
+<div class="day-detail-mask" id="dayDetailMask"></div>
+<div class="day-detail-panel" id="dayDetailPanel">
+  <div class="day-detail-header">
+    <h3 id="dayDetailTitle">3月8日 周六</h3>
+    <button class="day-detail-close" id="dayDetailClose" type="button">&#10005;</button>
+  </div>
+  <div class="day-detail-body" id="dayDetailList"></div>
+</div>
+
 <!-- Detail Overlay (inline editing) -->
 <div class="detail-mask" id="detailMask"></div>
 <div class="detail-overlay" id="detailPanel">
@@ -179,11 +193,41 @@
         </div>
       </div>
       <div class="settings-section">
+        <h4>用户画像</h4>
+        <div class="setting-row setting-row-col">
+          <div class="setting-info">
+            <div class="s-label">当前画像标签</div>
+            <div class="s-desc">用于 AI 拆分任务时更好地贴合你的类型</div>
+            <div class="settings-profile-tags" id="settingsProfileTags">暂无</div>
+          </div>
+          <div class="setting-ctrl"><button class="dbtn" style="font-size:11px" id="editProfileBtn">重新设置画像</button></div>
+        </div>
+      </div>
+      <div class="settings-section">
         <h4>数据管理</h4>
         <div class="setting-row"><div class="setting-info"><div class="s-label">导出/导入</div></div><div style="display:flex;gap:6px"><button class="dbtn" style="font-size:11px" id="exportBtn">导出</button><button class="dbtn" style="font-size:11px" id="importBtn">导入</button><input type="file" id="impFile" accept=".json" style="display:none"></div></div>
       </div>
     </div>
     <div class="modal-foot"><button class="dbtn" id="settingsModalCancel">取消</button><button class="dbtn dbtn-primary" id="settingsModalSave">保存</button></div>
+  </div>
+</div>
+
+<!-- 使用目的选择（创建待办时若未选过则弹出） -->
+<div class="modal-bg" id="purposeModal">
+  <div class="modal onboarding-modal">
+    <div class="modal-head">
+      <h3>选择使用目的</h3>
+      <button class="modal-x" id="purposeModalClose">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <p class="onboarding-desc">你主要想用本应用达成什么目标？选择后 AI 拆分将更贴合你的需求。</p>
+      <div class="onboarding-options" id="purposeModalOptions"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="dbtn" id="purposeModalSkip">跳过</button>
+      <div style="flex:1"></div>
+      <button class="dbtn dbtn-primary" id="purposeModalOk">确定</button>
+    </div>
   </div>
 </div>
 
@@ -206,6 +250,26 @@
         <h4>&#128161; 最小可开始版本</h4>
         <p id="miniStartText">选择一个任务开始吧！</p>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- 用户画像引导（首次打开：身份角色 + 时间管理挑战） -->
+<div class="modal-bg" id="onboardingModal">
+  <div class="modal onboarding-modal">
+    <div class="modal-head">
+      <h3 id="onboardingTitle">设置你的画像</h3>
+      <span class="onboarding-step" id="onboardingStep">1/2</span>
+    </div>
+    <div class="modal-body">
+      <p class="onboarding-desc" id="onboardingDesc">选择最符合你的身份，AI 将据此为你定制任务拆分建议。</p>
+      <div class="onboarding-options" id="onboardingOptions"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="dbtn" id="onboardingPrev" style="visibility:hidden">上一步</button>
+      <div style="flex:1"></div>
+      <button class="dbtn dbtn-primary" id="onboardingNext">下一步</button>
+      <button class="dbtn dbtn-primary" id="onboardingDone" style="display:none">完成</button>
     </div>
   </div>
 </div>

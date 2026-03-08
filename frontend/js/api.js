@@ -2,11 +2,18 @@
 
 const API_BASE = ''; // Same origin
 
-export async function parseTaskWithAI(text) {
-  const response = await fetch(`${API_BASE}/api/parse-task`, {
+export async function parseTaskWithAI(text, profileContext, templateInfo = null) {
+  const body = { text };
+  if (profileContext && (profileContext.tags?.length || profileContext.role || profileContext.purpose || profileContext.challenge)) {
+    body.profile = profileContext;
+  }
+  if (templateInfo && templateInfo.label && templateInfo.fullText) {
+    body.templateInfo = { label: templateInfo.label, fullText: templateInfo.fullText, groupName: templateInfo.groupName || '' };
+  }
+  const response = await fetch(`${API_BASE}/api/ai/parse-task`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ task: text })
+    body: JSON.stringify(body)
   });
   
   if (!response.ok) {
