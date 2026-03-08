@@ -79,6 +79,7 @@ const DEFAULT_SETTINGS = {
   dailyWorkHours: 4,
   splitThreshold: 6,
   autoAssignAfterSplit: true,
+  weeklyAvailability: [],
   weeklyAvailabilitySlots: [],
   defaultCalendarView: 'month',
   habitMemory: { taskPatterns: [] }
