@@ -9,9 +9,10 @@ easy task1: 统计耗时
 
 import { 
   uid, fmtDate, esc, dlText, calcQuadrant, calcPriority, 
-  getQClass, totalHours, getWeekStart, WEEKDAYS, Q_LABELS, Q_SHORT 
+  getQClass, totalHours, getWeekStart, WEEKDAYS, Q_LABELS, Q_SHORT,
+  USER_PROFILE_OPTIONS, TASK_TEMPLATE_GROUPS, getTemplateForInput
 } from './utils.js';
-import { loadTasks, saveTasks, loadSettings, saveSettings } from './storage.js';
+import { loadTasks, saveTasks, loadSettings, saveSettings, loadProfile, saveProfile } from './storage.js';
 import { parseTaskWithAI, checkAIHealth } from './api.js';
 
 const SLOT_EPSILON = 1e-6;
@@ -113,13 +114,15 @@ function normalizeWeeklyAvailabilitySlots(slots) {
   const normalized = [];
 
   slots.forEach(slot => {
-    const dayOfWeek = Number(slot?.dayOfWeek);
+    const dayRaw = slot?.weekday ?? slot?.dayOfWeek;
+    const dayOfWeek = Number(dayRaw);
     const startMin = parseTimeToMinutes(String(slot?.start || ''));
     const endMin = parseTimeToMinutes(String(slot?.end || ''));
     if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) return;
     if (startMin == null || endMin == null || endMin <= startMin) return;
 
     const safe = {
+      weekday: dayOfWeek,
       dayOfWeek,
       start: minutesToTime(startMin),
       end: minutesToTime(endMin)
@@ -138,8 +141,63 @@ function normalizeWeeklyAvailabilitySlots(slots) {
   return normalized;
 }
 
+function syncWeeklyAvailabilitySettingsObject(settingsObj) {
+  if (!settingsObj || typeof settingsObj !== 'object') return false;
+  const beforeWeekly = JSON.stringify(settingsObj.weeklyAvailability || []);
+  const beforeWeeklySlots = JSON.stringify(settingsObj.weeklyAvailabilitySlots || []);
+  const source = Array.isArray(settingsObj.weeklyAvailability) && settingsObj.weeklyAvailability.length
+    ? settingsObj.weeklyAvailability
+    : settingsObj.weeklyAvailabilitySlots;
+  const normalized = normalizeWeeklyAvailabilitySlots(source || []);
+
+  settingsObj.weeklyAvailability = normalized.map(slot => ({
+    weekday: slot.weekday,
+    start: slot.start,
+    end: slot.end
+  }));
+  settingsObj.weeklyAvailabilitySlots = normalized.map(slot => ({
+    dayOfWeek: slot.dayOfWeek,
+    start: slot.start,
+    end: slot.end
+  }));
+
+  return (
+    beforeWeekly !== JSON.stringify(settingsObj.weeklyAvailability) ||
+    beforeWeeklySlots !== JSON.stringify(settingsObj.weeklyAvailabilitySlots)
+  );
+}
+
 function getActiveWeeklyAvailabilitySlots() {
-  return normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+  const source = (Array.isArray(settings.weeklyAvailability) && settings.weeklyAvailability.length)
+    ? settings.weeklyAvailability
+    : settings.weeklyAvailabilitySlots;
+  return normalizeWeeklyAvailabilitySlots(source || []);
+}
+
+function getConfiguredSlotLabelsForDate(dateInput, weeklySlots = null) {
+  const slots = weeklySlots ?? getActiveWeeklyAvailabilitySlots();
+  if (!slots.length) return [];
+  const date = typeof dateInput === 'string'
+    ? new Date(`${dateInput}T00:00:00`)
+    : new Date(dateInput);
+  if (Number.isNaN(date.getTime())) return [];
+  const day = date.getDay();
+  return slots
+    .filter(slot => slot.dayOfWeek === day)
+    .map(slot => `${slot.start}-${slot.end}`);
+}
+
+function getDefaultSlotLabelForDate(dateInput, weeklySlots = null) {
+  const labels = getConfiguredSlotLabelsForDate(dateInput, weeklySlots);
+  return labels[0] || '';
+}
+
+function getSlotLabelFromSlot(slot) {
+  if (!slot) return '';
+  const startMin = Number(slot.startMin);
+  const endMin = Number(slot.endMin);
+  if (!Number.isFinite(startMin) || !Number.isFinite(endMin) || endMin <= startMin) return '';
+  return `${minutesToTime(startMin)}-${minutesToTime(endMin)}`;
 }
 
 function getDailyCapacityForDate(dateInput, weeklySlots = null) {
@@ -212,6 +270,7 @@ function buildCapacitySlots({
           dateStr: ds,
           dateObj: new Date(d),
           startMin,
+          endMin,
           capacity,
           remaining: capacity
         });
@@ -224,6 +283,7 @@ function buildCapacitySlots({
         dateStr: ds,
         dateObj: new Date(d),
         startMin: 0,
+        endMin: null,
         capacity,
         remaining: capacity
       });
@@ -253,15 +313,32 @@ function buildCapacitySlots({
     .sort((a, b) => (a.dateObj - b.dateObj) || (a.startMin - b.startMin));
 }
 
+function buildAvailableSlots(settingsObj, today, assignmentDeadline, existingAssignedDays, maxDays = 30) {
+  const safeSettings = settingsObj || {};
+  const weeklySource = (Array.isArray(safeSettings.weeklyAvailability) && safeSettings.weeklyAvailability.length)
+    ? safeSettings.weeklyAvailability
+    : safeSettings.weeklyAvailabilitySlots;
+  const weeklySlots = normalizeWeeklyAvailabilitySlots(weeklySource || []);
+  return buildCapacitySlots({
+    startDate: today,
+    assignmentDeadline,
+    maxDays,
+    weeklySlots,
+    usedHoursByDate: existingAssignedDays || {},
+    fallbackDailyHours: Number(safeSettings.dailyWorkHours) || 4
+  });
+}
+
 function ensureDayAssignmentObject(task, dateStr) {
   if (!task.assignedDays) task.assignedDays = {};
   if (!task.assignedDays[dateStr]) {
-    task.assignedDays[dateStr] = { subtaskIds: [], hours: 0 };
+    task.assignedDays[dateStr] = { subtaskIds: [], hours: 0, slotBySubtaskId: {} };
   }
   if (typeof task.assignedDays[dateStr] === 'number') {
     task.assignedDays[dateStr] = {
       subtaskIds: ['__whole_' + task.id],
-      hours: Number(task.assignedDays[dateStr]) || 0
+      hours: Number(task.assignedDays[dateStr]) || 0,
+      slotBySubtaskId: {}
     };
   }
   if (!Array.isArray(task.assignedDays[dateStr].subtaskIds)) {
@@ -270,10 +347,17 @@ function ensureDayAssignmentObject(task, dateStr) {
   if (!Number.isFinite(Number(task.assignedDays[dateStr].hours))) {
     task.assignedDays[dateStr].hours = 0;
   }
+  if (
+    !task.assignedDays[dateStr].slotBySubtaskId ||
+    typeof task.assignedDays[dateStr].slotBySubtaskId !== 'object' ||
+    Array.isArray(task.assignedDays[dateStr].slotBySubtaskId)
+  ) {
+    task.assignedDays[dateStr].slotBySubtaskId = {};
+  }
   return task.assignedDays[dateStr];
 }
 
-function appendAssignment(task, dateStr, subtaskId, hours) {
+function appendAssignment(task, dateStr, subtaskId, hours, slotLabel = '') {
   const assignHours = roundHours(hours);
   if (assignHours <= 0) return;
   const dayData = ensureDayAssignmentObject(task, dateStr);
@@ -281,6 +365,17 @@ function appendAssignment(task, dateStr, subtaskId, hours) {
     dayData.subtaskIds.push(subtaskId);
   }
   dayData.hours = roundHours((dayData.hours || 0) + assignHours);
+  const safeLabel = String(slotLabel || '').trim();
+  if (!safeLabel) return;
+  const current = String(dayData.slotBySubtaskId[subtaskId] || '').trim();
+  if (!current) {
+    dayData.slotBySubtaskId[subtaskId] = safeLabel;
+    return;
+  }
+  const labels = current.split(' / ').map(item => item.trim()).filter(Boolean);
+  if (labels.includes(safeLabel)) return;
+  labels.push(safeLabel);
+  dayData.slotBySubtaskId[subtaskId] = labels.join(' / ');
 }
 
 function getSubtaskGroupKey(title) {
@@ -291,7 +386,17 @@ function getSubtaskGroupKey(title) {
   while (indexSuffixPattern.test(key)) {
     key = key.replace(indexSuffixPattern, '').trim();
   }
-  return key.toLowerCase() || '__ungrouped__';
+  return classifySubtaskGroup(key);
+}
+
+function classifySubtaskGroup(title) {
+  const text = String(title || '').toLowerCase();
+  if (!text) return 'other';
+  if (/\u6587\u732E|\u9605\u8BFB|\u67E5\u8D44\u6599|read|literature/i.test(text)) return 'reading';
+  if (/\u521D\u7A3F|\u5199\u4F5C|\u64B0\u5199|write|draft/i.test(text)) return 'writing';
+  if (/\u4FEE\u6539|\u6DA6\u8272|\u5B8C\u5584|revise|polish/i.test(text)) return 'revise';
+  if (/\u6392\u7248|\u683C\u5F0F|format/i.test(text)) return 'format';
+  return 'other';
 }
 
 function interleaveSubtasksByGroup(items) {
@@ -320,27 +425,50 @@ function interleaveSubtasksByGroup(items) {
   return mixed;
 }
 
-function pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, groupKey) {
-  let fallback = null;
+function pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, slotTaskDateState, groupKey, taskId) {
+  let bestSlot = null;
+  let bestRank = Number.POSITIVE_INFINITY;
+  const usedDates = slotTaskDateState.get(taskId) || new Set();
+
   for (const slot of slotList) {
     if (slot.remaining <= SLOT_EPSILON) continue;
     if (assignmentDeadline && slot.dateObj > assignmentDeadline) break;
-    if (!fallback) fallback = slot;
+
     const usedGroups = slotGroupState.get(slot.key);
-    if (!usedGroups || !usedGroups.has(groupKey)) return slot;
+    const hasGroupInSlot = !!(usedGroups && usedGroups.has(groupKey));
+    const hasTaskOnDate = usedDates.has(slot.dateStr);
+
+    let rank = 3;
+    if (!hasGroupInSlot && !hasTaskOnDate) rank = 0;
+    else if (!hasGroupInSlot && hasTaskOnDate) rank = 1;
+    else if (hasGroupInSlot && !hasTaskOnDate) rank = 2;
+
+    if (rank < bestRank) {
+      bestRank = rank;
+      bestSlot = slot;
+      if (rank === 0) break;
+    }
   }
-  return fallback;
+
+  return bestSlot;
 }
 
-function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, slotGroupState) {
+function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, slotGroupState, slotTaskDateState) {
   let remaining = roundHours(Number(sub.estimatedHours) || 1);
   const groupKey = getSubtaskGroupKey(sub.title);
 
   while (remaining > SLOT_EPSILON) {
-    const slot = pickSlotForGroup(slotList, assignmentDeadline, slotGroupState, groupKey);
+    const slot = pickSlotForGroup(
+      slotList,
+      assignmentDeadline,
+      slotGroupState,
+      slotTaskDateState,
+      groupKey,
+      task.id
+    );
     if (!slot) break;
     const assign = Math.min(remaining, slot.remaining);
-    appendAssignment(task, slot.dateStr, sub.id, assign);
+    appendAssignment(task, slot.dateStr, sub.id, assign, getSlotLabelFromSlot(slot));
     slot.remaining = roundHours(slot.remaining - assign);
     remaining = roundHours(remaining - assign);
 
@@ -350,6 +478,13 @@ function assignSubtaskToCapacitySlots(task, sub, slotList, assignmentDeadline, s
       slotGroupState.set(slot.key, groups);
     }
     groups.add(groupKey);
+
+    let taskDates = slotTaskDateState.get(task.id);
+    if (!taskDates) {
+      taskDates = new Set();
+      slotTaskDateState.set(task.id, taskDates);
+    }
+    taskDates.add(slot.dateStr);
   }
 
   return remaining <= SLOT_EPSILON;
@@ -367,6 +502,23 @@ let confirmCb = null;
 let confirmCb2 = null;  // 2026.03.05 17:13 - 新增二次确认回调
 let sortMode = 'deadline'; // 'deadline' | 'priority' | 'manual'
 
+// ======== Task Title Examples ========
+const titleExamples = [
+  '完成课程论文',
+  '准备下周 presentation',
+  '整理项目文档',
+  '学习 React Hooks',
+  '完成健身计划',
+  '阅读技术书籍 30 分钟',
+  '复习考试重点',
+  '整理桌面文件',
+  '写周报',
+  '预约牙医检查',
+  '购买生活用品',
+  '规划周末行程'
+];
+let currentExampleIndex = 0;
+
 // ======== Drag State ========
 let draggedTaskId = null;
 let draggedSubtaskId = null;
@@ -377,7 +529,8 @@ let detailSubDragId = null;     // 详情面板子任务拖拽排序
 /** 初始化应用：加载数据，设置事件监听器，首次渲染 **/
 function init() {
   settings = loadSettings();
-  settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+  const normalizedSettingsChanged = syncWeeklyAvailabilitySettingsObject(settings);
+  if (normalizedSettingsChanged) saveSettings(settings);
   tasks = loadTasks();
   migrateTasks();
   sortMode = settings.defaultSortMode || 'deadline';
@@ -385,6 +538,10 @@ function init() {
   viewDate = new Date();
   renderAll();
   setupListeners();
+  setupOnboarding();
+  const profile = loadProfile();
+  if (!profile.completed) showOnboarding();
+  registerQAHooks();
 }
 
 /** 迁移任务数据 **/
@@ -614,13 +771,13 @@ function setView(v) {
 
 function navPrev() {
   if (currentView === 'month') { viewDate.setMonth(viewDate.getMonth() - 1); }
-  else { viewDate.setDate(viewDate.getDate() - 7); }
+  else if (currentView === 'week') { viewDate.setDate(viewDate.getDate() - 7); }
   renderMainView(); updateNavTitle();
 }
 
 function navNext() {
   if (currentView === 'month') { viewDate.setMonth(viewDate.getMonth() + 1); }
-  else { viewDate.setDate(viewDate.getDate() + 7); }
+  else if (currentView === 'week') { viewDate.setDate(viewDate.getDate() + 7); }
   renderMainView(); updateNavTitle();
 }
 
@@ -629,16 +786,21 @@ function navToday() { viewDate = new Date(); renderMainView(); updateNavTitle();
 function updateNavTitle() {
   const el = document.getElementById('navTitle');
   if (currentView === 'month') { el.textContent = viewDate.getFullYear() + '年' + (viewDate.getMonth() + 1) + '月'; }
-  else {
+  else if (currentView === 'week') {
     const start = getWeekStart(viewDate);
     const end = new Date(start); end.setDate(end.getDate() + 6);
     el.textContent = (start.getMonth() + 1) + '/' + start.getDate() + ' - ' + (end.getMonth() + 1) + '/' + end.getDate();
+  }
+  else if (currentView === 'today') {
+    const today = new Date();
+    el.textContent = today.getFullYear() + '年' + (today.getMonth() + 1) + '月' + today.getDate() + '日 · 今日专注';
   }
 }
 
 function renderMainView() {
   if (currentView === 'month') renderMonth();
-  else renderWeek();
+  else if (currentView === 'week') renderWeek();
+  else if (currentView === 'today') renderToday();
 }
 
 /** 构建日期映射 */
@@ -650,13 +812,26 @@ function buildDayMap(activeTasks) {
       if (!dayMap[ds]) dayMap[ds] = [];
       const dayData = t.assignedDays[ds];
       if (typeof dayData === 'number') {
-        dayMap[ds].push({ task: t, sub: { id: '__whole_' + t.id, title: t.title, estimatedHours: dayData } });
+        dayMap[ds].push({
+          task: t,
+          sub: { id: '__whole_' + t.id, title: t.title, estimatedHours: dayData },
+          slotLabel: ''
+        });
       } else if (dayData && dayData.subtaskIds) {
+        const slotBySubtaskId = (dayData.slotBySubtaskId && typeof dayData.slotBySubtaskId === 'object')
+          ? dayData.slotBySubtaskId
+          : {};
         dayData.subtaskIds.forEach(sid => {
           let sub;
           if (sid.startsWith('__whole_')) { sub = { id: sid, title: t.title, estimatedHours: t.estimatedHours || 0 }; }
           else { sub = t.subtasks.find(s => s.id === sid); }
-          if (sub) dayMap[ds].push({ task: t, sub });
+          if (sub) {
+            dayMap[ds].push({
+              task: t,
+              sub,
+              slotLabel: String(slotBySubtaskId[sid] || '')
+            });
+          }
         });
       }
     });
@@ -695,7 +870,7 @@ function renderMonth() {
       <div class="cal-date"><span class="cal-date-num${isToday ? ' is-today' : ''}">${d}</span><span class="cal-hours${over ? ' over' : ''}">${hrs > 0 ? hrs + 'h' : ''}</span></div>
       <div class="cal-tasks-mini">${list.slice(0, 3).map(x => {
         const isCompleted = x.sub.completed ? ' completed' : '';
-        return `<div class="cal-task-mini${isCompleted}" draggable="true" data-tid="${x.task.id}" data-sid="${x.sub.id}">
+        return `<div class="cal-task-mini${isCompleted}" draggable="true" data-tid="${x.task.id}" data-sid="${x.sub.id}" onclick="showSubtaskDetail('${x.task.id}', '${x.sub.id}')">
           <span class="cal-task-title">${esc(x.sub.title)}</span>
         </div>`;
       }).join('')}${list.length > 3 ? `<div class="cal-task-mini" style="color:var(--text-4)">+${list.length - 3} more</div>` : ''}</div>
@@ -711,8 +886,8 @@ function renderMonth() {
   html += '</div>';
   body.innerHTML = html;
   
-  // 绑定日历拖拽事件
   bindCalendarDragEvents();
+  bindDayCellClick();
 }
 
 /** 渲染周视图 */
@@ -728,6 +903,7 @@ function renderWeek() {
     const d = new Date(start); d.setDate(d.getDate() + i);
     const ds = fmtDate(d);
     const isToday = ds === today;
+    const configuredSlotLabels = getConfiguredSlotLabelsForDate(ds);
     let list = dayMap[ds] || [];
     
     // 根据 Eisenhower 象限排序，未指定象限的放在最后
@@ -741,21 +917,33 @@ function renderWeek() {
     const hrs = list.reduce((s, x) => s + (x.sub.estimatedHours || 0), 0);
     const dayCapacity = getDailyCapacityForDate(ds);
     const over = dayCapacity > 0 ? hrs > dayCapacity : hrs > 0;
+    const slotHeader = configuredSlotLabels.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin-top:4px;">
+          ${configuredSlotLabels.map(label => `<span style="font-size:10px;line-height:1;padding:2px 6px;border-radius:10px;background:var(--bg-3);color:var(--text-3);">${esc(label)}</span>`).join('')}
+        </div>`
+      : '';
 
     html += `<div class="week-col" data-date="${ds}">
       <div class="week-col-header">
         <div class="wdate${isToday ? ' is-today' : ''}">${d.getDate()}</div>
         <div class="wday">${WEEKDAYS[d.getDay()]}</div>
         <div class="whours${over ? ' over' : ''}">${hrs}h / ${dayCapacity}h</div>
+        ${slotHeader}
       </div>
       <div class="week-col-body" data-date="${ds}">
         ${list.length ? list.map(x => {
           const isCompleted = x.sub.completed ? ' completed' : '';
-          return `<div class="week-task ${getQClass(x.task.eisenhowerQuadrant)}${isCompleted}" draggable="true" data-sid="${x.sub.id}" data-tid="${x.task.id}">
-          <div class="week-task-title">${esc(x.sub.title)}</div>
-          <div class="week-task-parent">${esc(x.task.title)}</div>
-          <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
-        </div>`;
+
+          const slotLabel = String(x.slotLabel || '').trim() || (configuredSlotLabels.length === 1 ? configuredSlotLabels[0] : '');
+          const slotBadge = slotLabel
+            ? `<span style="display:inline-block;font-size:10px;line-height:1;padding:2px 6px;border-radius:10px;background:var(--bg-3);color:var(--text-3);margin-right:6px;">${esc(slotLabel)}</span>`
+            : '';
+        return `<div class="week-task ${getQClass(x.task.eisenhowerQuadrant)}${isCompleted}" draggable="true" data-sid="${x.sub.id}" data-tid="${x.task.id}" onclick="showSubtaskDetail('${x.task.id}', '${x.sub.id}')">
+  <div class="week-task-title">${esc(x.sub.title)}</div>
+  <div class="week-task-parent">${esc(x.task.title)}</div>
+  <div class="week-task-hours">${slotBadge}${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}" onclick="event.stopPropagation();removeFromCalendar('${x.task.id}', '${x.sub.id}', '${ds}')">&#10005;</span></div>
+</div>`;
+       
         }).join('') : '<div class="week-empty">暂无任务</div>'}
       </div>
     </div>`;
@@ -763,12 +951,219 @@ function renderWeek() {
   html += '</div>';
   body.innerHTML = html;
   
-  // 
   bindCalendarDragEvents();
-  
   bindWeekTaskDrag();
+  bindDayCellClick();
 }
 
+/** 点击某天放大该日信息，点击空白关闭 */
+function openDayDetail(dateStr) {
+  const active = tasks.filter(t => t.status === 'active');
+  const dayMap = buildDayMap(active);
+  const list = dayMap[dateStr] || [];
+  const d = new Date(dateStr + 'T12:00:00');
+  const titleStr = `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${WEEKDAYS[d.getDay()]}`;
+  document.getElementById('dayDetailTitle').textContent = titleStr;
+  const totalH = list.reduce((s, x) => s + (x.sub.estimatedHours || 0), 0);
+  const container = document.getElementById('dayDetailList');
+  if (!list.length) {
+    container.innerHTML = '<div class="day-detail-empty">当日暂无分配任务</div>';
+  } else {
+    const qOrder = { Q1: 0, Q2: 1, Q3: 2, Q4: 3 };
+    const sorted = [...list].sort((a, b) => (qOrder[a.task.eisenhowerQuadrant] ?? 3) - (qOrder[b.task.eisenhowerQuadrant] ?? 3));
+    container.innerHTML = `<div class="day-detail-summary">共 ${list.length} 项 · 预估 ${totalH.toFixed(1)}h</div>` + sorted.map(x => {
+      const q = getQClass(x.task.eisenhowerQuadrant);
+      const done = x.sub.completed ? ' completed' : '';
+      const hrs = x.sub.estimatedHours != null ? x.sub.estimatedHours : '-';
+      return `<div class="day-detail-item${done}" data-tid="${x.task.id}" data-date="${dateStr}">
+        <span class="q-dot ${q}"></span>
+        <div class="day-detail-item-content">
+          <div class="day-detail-item-title">${esc(x.sub.title)}</div>
+          <div class="day-detail-item-parent">${esc(x.task.title)}</div>
+          <div class="day-detail-item-meta">${hrs}h · ${Q_SHORT[x.task.eisenhowerQuadrant] || 'Q4'}</div>
+        </div>
+      </div>`;
+    }).join('');
+    container.querySelectorAll('.day-detail-item').forEach(el => {
+      el.addEventListener('click', e => {
+        e.stopPropagation();
+        selectTask(el.dataset.tid);
+        closeDayDetail();
+        renderAll();
+        showTaskDetail(el.dataset.tid);
+      });
+    });
+  }
+  document.getElementById('dayDetailMask').classList.add('open');
+  document.getElementById('dayDetailPanel').classList.add('open');
+}
+
+function closeDayDetail() {
+  document.getElementById('dayDetailMask').classList.remove('open');
+  document.getElementById('dayDetailPanel').classList.remove('open');
+}
+
+function bindDayCellClick() {
+  document.querySelectorAll('.cal-cell[data-date]').forEach(cell => {
+    cell.addEventListener('click', () => openDayDetail(cell.dataset.date));
+  });
+  document.querySelectorAll('.week-col[data-date]').forEach(col => {
+    col.addEventListener('click', e => {
+      if (e.target.closest('.week-task-rm')) return;
+      openDayDetail(col.dataset.date);
+    });
+  });
+  const mask = document.getElementById('dayDetailMask');
+  const closeBtn = document.getElementById('dayDetailClose');
+  if (mask && !mask._bound) { mask._bound = true; mask.onclick = closeDayDetail; }
+  if (closeBtn && !closeBtn._bound) { closeBtn._bound = true; closeBtn.onclick = closeDayDetail; }
+}
+
+
+/** 渲染今日专注视图 */
+function renderToday() {
+  const body = document.getElementById('mainBody');
+  const todayStr = fmtDate(new Date());
+  const active = tasks.filter(t => t.status === 'active');
+  
+  // 收集今日所有子任务
+  let todaySubs = [];
+  active.forEach(t => {
+    if (!t.subtasks) return;
+    t.subtasks.forEach((sub, idx) => {
+      if (sub.completed) return;
+      // 检查是否已分配到今日
+      const isAssignedToday = t.assignedDays && t.assignedDays[todayStr];
+      todaySubs.push({
+        task: t,
+        sub: sub,
+        priority: calcPriority(t),
+        isAssigned: !!isAssignedToday,
+        order: idx
+      });
+    });
+  });
+  
+  // 按优先级排序，取前三
+  todaySubs.sort((a, b) => b.priority - a.priority);
+  const top3 = todaySubs.slice(0, 3);
+  
+  // 为每个子任务生成最小可开始版本
+  const miniStartActions = [
+    { keyword: ['写', '论文', '报告', '文档'], action: '打开文档写3行大纲' },
+    { keyword: ['读', '书', '文章', '资料'], action: '读第一页并标记3个重点' },
+    { keyword: ['学', '课程', '教程'], action: '观看5分钟入门视频' },
+    { keyword: ['整理', '清理', '收拾'], action: '花5分钟整理最显眼的一个区域' },
+    { keyword: ['准备', '计划', '规划'], action: '列出3个必须完成的关键点' },
+    { keyword: ['设计', '画图', '原型'], action: '在纸上画一个草图框架' },
+    { keyword: ['代码', '开发', '编程'], action: '创建一个文件并写5行伪代码' },
+    { keyword: ['测试', '调试', '修复'], action: '运行一次并记录第一个错误' },
+    { keyword: ['会议', '讨论', '沟通'], action: '列出3个要讨论的核心问题' },
+    { keyword: ['购买', '买', '采购'], action: '打开购物网站搜索第一个商品' }
+  ];
+  
+  function generateMiniStart(subtaskTitle) {
+    const title = subtaskTitle.toLowerCase();
+    for (const rule of miniStartActions) {
+      if (rule.keyword.some(k => title.includes(k))) {
+        return rule.action;
+      }
+    }
+    // 默认模板
+    const defaults = [
+      '花5分钟写下3个关键词',
+      '打开相关应用/文档看一眼',
+      '设置一个5分钟计时器开始',
+      '写下完成这个任务的第一步',
+      '收集一个相关的参考资料'
+    ];
+    return defaults[Math.floor(Math.random() * defaults.length)];
+  }
+  
+  let html = '<div class="today-view">';
+  
+  // 顶部欢迎语
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? '早上好' : hour < 18 ? '下午好' : '晚上好';
+  html += `<div class="today-greeting">${greeting}，今天专注这三件事</div>`;
+  
+  // 前三任务 + 每个子任务的最小可开始版本
+  if (top3.length > 0) {
+    html += '<div class="today-top3">';
+    top3.forEach((item, i) => {
+      const qClass = getQClass(item.task.eisenhowerQuadrant);
+      const miniStart = generateMiniStart(item.sub.title);
+      html += `
+        <div class="today-task-card ${qClass}" data-tid="${item.task.id}" data-sid="${item.sub.id}">
+          <div class="today-task-rank">${i + 1}</div>
+          <div class="today-task-content">
+            <div class="today-task-title">${esc(item.sub.title)}</div>
+            <div class="today-task-parent">来自：${esc(item.task.title)}</div>
+            <div class="today-task-ministart">
+              <span class="ministart-label">🚀 最小开始：</span>
+              <span class="ministart-action">${miniStart}</span>
+            </div>
+            <div class="today-task-meta">
+              <span class="today-task-priority">优先级 ${item.priority.toFixed(1)}</span>
+              <span class="today-task-hours">${formatDuration(item.sub.estimatedHours || 1)}</span>
+              ${item.isAssigned ? '<span class="today-task-assigned">已排程</span>' : '<span class="today-task-unassigned">未排程</span>'}
+            </div>
+          </div>
+          <div class="today-task-actions">
+            <button class="today-btn-pomodoro" data-tid="${item.task.id}" data-sid="${item.sub.id}" title="开始番茄钟">🍅</button>
+            <button class="today-btn-done" data-tid="${item.task.id}" data-sid="${item.sub.id}" title="完成">✓</button>
+          </div>
+        </div>
+      `;
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="today-empty">今天没有待办子任务，去创建新任务吧！</div>';
+  }
+  
+  // 今日统计
+  const completedToday = todaySubs.filter(x => x.sub.completed).length;
+  html += `
+    <div class="today-stats">
+      <div class="today-stat">
+        <span class="today-stat-num">${top3.length}</span>
+        <span class="today-stat-label">待办子任务</span>
+      </div>
+      <div class="today-stat">
+        <span class="today-stat-num">${todaySubs.filter(x => x.isAssigned).length}</span>
+        <span class="today-stat-label">已排程</span>
+      </div>
+    </div>
+  `;
+  
+  html += '</div>';
+  body.innerHTML = html;
+  
+  // 绑定事件
+  document.querySelectorAll('.today-task-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const tid = card.dataset.tid;
+      const sid = card.dataset.sid;
+      showSubtaskDetail(tid, sid);
+    });
+  });
+  
+  document.querySelectorAll('.today-btn-pomodoro').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      openPomodoroTimer(btn.dataset.tid, btn.dataset.sid);
+    });
+  });
+  
+  document.querySelectorAll('.today-btn-done').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      completeSubtask(btn.dataset.tid, btn.dataset.sid);
+    });
+  });
+}
+
+/** 为日历视图绑定拖拽事件（月视图格子、周视图列） */
 /** 绑定日历拖拽事件 */
 function bindCalendarDragEvents() {
   // 绑定拖拽开始事件
@@ -866,6 +1261,9 @@ function handleCalendarDrop(targetDate) {
         if (idx > -1) {
           dayData.subtaskIds.splice(idx, 1);
           dayData.hours -= subtask.estimatedHours;
+          if (dayData.slotBySubtaskId && typeof dayData.slotBySubtaskId === 'object') {
+            delete dayData.slotBySubtaskId[draggedSubtaskId];
+          }
           if (dayData.hours <= 0 || dayData.subtaskIds.length === 0) {
             delete task.assignedDays[ds];
           }
@@ -877,19 +1275,32 @@ function handleCalendarDrop(targetDate) {
   // 确保目标日期有分配对象
   if (!task.assignedDays) task.assignedDays = {};
   if (!task.assignedDays[targetDate]) {
-    task.assignedDays[targetDate] = { subtaskIds: [], hours: 0 };
+    task.assignedDays[targetDate] = { subtaskIds: [], hours: 0, slotBySubtaskId: {} };
   }
   let targetDay = task.assignedDays[targetDate];
   
   // 如果目标日期是以数字形式存在（旧格式），则转换为对象格式
   if (typeof targetDay === 'number') {
-    task.assignedDays[targetDate] = { subtaskIds: ['__whole_' + task.id], hours: targetDay };
+    task.assignedDays[targetDate] = {
+      subtaskIds: ['__whole_' + task.id],
+      hours: targetDay,
+      slotBySubtaskId: {}
+    };
     targetDay = task.assignedDays[targetDate];
+  }
+  if (!targetDay.slotBySubtaskId || typeof targetDay.slotBySubtaskId !== 'object') {
+    targetDay.slotBySubtaskId = {};
   }
   
   if (!targetDay.subtaskIds.includes(draggedSubtaskId)) {
     targetDay.subtaskIds.push(draggedSubtaskId);
     targetDay.hours += subtask.estimatedHours;
+  }
+  const movedSlotLabel = getDefaultSlotLabelForDate(targetDate);
+  if (movedSlotLabel) {
+    targetDay.slotBySubtaskId[draggedSubtaskId] = movedSlotLabel;
+  } else {
+    delete targetDay.slotBySubtaskId[draggedSubtaskId];
   }
   
   // 如果是拖动子任务，则标记为手动分配并记录分配日期
@@ -924,6 +1335,9 @@ function removeFromCalendar(tid, sid, date) {
     if (idx > -1) {
       const sub = task.subtasks.find(s => s.id === sid);
       dayData.subtaskIds.splice(idx, 1);
+      if (dayData.slotBySubtaskId && typeof dayData.slotBySubtaskId === 'object') {
+        delete dayData.slotBySubtaskId[sid];
+      }
       if (sub) dayData.hours -= sub.estimatedHours;
       if (dayData.subtaskIds.length === 0 || dayData.hours <= 0) {
         delete task.assignedDays[date];
@@ -1107,15 +1521,29 @@ function replaceAssignmentIds(task, oldSid, oldHours, newSubs) {
 
     // 如果是旧格式的数字分配，且正好对应被拆分的子任务，则转换为对象格式并替换为新子任务 ID
     if (typeof dayData === 'number') {
-      task.assignedDays[date] = { subtaskIds: ['__whole_' + task.id], hours: dayData };
+      task.assignedDays[date] = {
+        subtaskIds: ['__whole_' + task.id],
+        hours: dayData,
+        slotBySubtaskId: {}
+      };
       dayData = task.assignedDays[date];
     }
 
     if (!dayData.subtaskIds) return;
     const idx = dayData.subtaskIds.indexOf(oldSid);
     if (idx === -1) return;
+    if (!dayData.slotBySubtaskId || typeof dayData.slotBySubtaskId !== 'object') {
+      dayData.slotBySubtaskId = {};
+    }
+    const oldSlotLabel = String(dayData.slotBySubtaskId[oldSid] || '').trim();
+    delete dayData.slotBySubtaskId[oldSid];
 
     dayData.subtaskIds.splice(idx, 1, ...newSids);
+    if (oldSlotLabel) {
+      newSids.forEach(newSid => {
+        dayData.slotBySubtaskId[newSid] = oldSlotLabel;
+      });
+    }
     dayData.hours = Math.max(0, (dayData.hours || 0) - oldHours + newTotalHours);
 
     if (dayData.subtaskIds.length === 0 || dayData.hours <= 0) {
@@ -1444,6 +1872,180 @@ function closeDetail() {
 }
 
 // ======== Detail Panel Split Functions ========
+const TASK_TYPE_CONFIG = [
+  {
+    id: 'paper',
+    priority: 10,
+    matchers: ['\u8BBA\u6587', /paper/i, /essay/i],
+    subtasks: [
+      { title: '\u6587\u732E\u7EFC\u8FF0', weight: 0.3 },
+      { title: '\u64B0\u5199\u521D\u7A3F', weight: 0.35 },
+      { title: '\u4FEE\u6539\u5B8C\u5584', weight: 0.2 },
+      { title: '\u683C\u5F0F\u6392\u7248', weight: 0.15 }
+    ]
+  },
+  {
+    id: 'study',
+    priority: 20,
+    matchers: ['\u5B66\u4E60', '\u590D\u4E60', '\u5907\u8003', '\u5237\u9898'],
+    subtasks: [
+      { title: '\u9884\u4E60\u6982\u89C8', weight: 0.2 },
+      { title: '\u6DF1\u5EA6\u5B66\u4E60', weight: 0.4 },
+      { title: '\u7EC3\u4E60\u5DE9\u56FA', weight: 0.25 },
+      { title: '\u603B\u7ED3\u590D\u4E60', weight: 0.15 }
+    ]
+  },
+  {
+    id: 'project',
+    priority: 30,
+    matchers: ['\u9879\u76EE', '\u5F00\u53D1', /demo/i, '\u7CFB\u7EDF'],
+    subtasks: [
+      { title: '\u9700\u6C42\u5206\u6790', weight: 0.2 },
+      { title: '\u65B9\u6848\u8BBE\u8BA1', weight: 0.25 },
+      { title: '\u5F00\u53D1\u5B9E\u73B0', weight: 0.4 },
+      { title: '\u6D4B\u8BD5\u90E8\u7F72', weight: 0.15 }
+    ]
+  },
+  {
+    id: 'default',
+    priority: 999,
+    matchers: [],
+    subtasks: [
+      { title: '\u9636\u6BB5 1', weight: 0.35 },
+      { title: '\u9636\u6BB5 2', weight: 0.3 },
+      { title: '\u9636\u6BB5 3', weight: 0.2 },
+      { title: '\u9636\u6BB5 4', weight: 0.15 }
+    ]
+  }
+];
+
+function getSplitTargetHours(task, totalHoursOverride = null) {
+  const override = Number(totalHoursOverride);
+  if (Number.isFinite(override) && override > 0) return override;
+  const safeTask = task || {};
+  const base = Number(totalHours(safeTask)) || Number(safeTask.estimatedHours) || 8;
+  return base > 0 ? base : 8;
+}
+
+function matchesTaskType(title, matcher) {
+  if (typeof matcher === 'string') {
+    return title.toLowerCase().includes(matcher.toLowerCase());
+  }
+  if (matcher instanceof RegExp) {
+    const safeFlags = matcher.flags.replace(/g/g, '');
+    return new RegExp(matcher.source, safeFlags).test(title);
+  }
+  return false;
+}
+
+function detectTaskType(title, config = TASK_TYPE_CONFIG) {
+  if (!Array.isArray(config) || !config.length) return TASK_TYPE_CONFIG[TASK_TYPE_CONFIG.length - 1];
+  const safeTitle = String(title || '').trim();
+  const sorted = [...config].sort((a, b) => (Number(a?.priority) || 0) - (Number(b?.priority) || 0));
+  const defaultType =
+    sorted.find(type => type?.id === 'default') ||
+    sorted[sorted.length - 1] ||
+    TASK_TYPE_CONFIG[TASK_TYPE_CONFIG.length - 1];
+
+  for (const type of sorted) {
+    if (!type || type.id === defaultType.id) continue;
+    if (typeof type.matcherFn === 'function') {
+      try {
+        if (type.matcherFn(safeTitle, type)) return type;
+      } catch (_) {}
+    }
+    const matchers = Array.isArray(type.matchers) ? type.matchers : [];
+    if (matchers.some(matcher => matchesTaskType(safeTitle, matcher))) return type;
+  }
+  return defaultType;
+}
+
+function allocateHoursByWeights(totalHours, templateSubtasks) {
+  const totalUnits = Math.round(Number(totalHours) * 2);
+  const source = Array.isArray(templateSubtasks) ? templateSubtasks : [];
+  const normalized = source
+    .map(item => ({
+      title: String(item?.title || '').trim(),
+      weight: Number(item?.weight)
+    }))
+    .filter(item => item.title);
+
+  if (!normalized.length || totalUnits <= 0) return [];
+
+  const keepCount = Math.min(normalized.length, totalUnits);
+  const kept = normalized.slice(0, keepCount);
+  const units = new Array(keepCount).fill(1);
+  const remainingUnits = totalUnits - keepCount;
+
+  if (remainingUnits > 0) {
+    let weights = kept.map(item => (Number.isFinite(item.weight) && item.weight > 0 ? item.weight : 0));
+    if (weights.every(weight => weight <= 0)) {
+      weights = new Array(keepCount).fill(1);
+    }
+    const weightSum = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+    const rawUnits = weights.map(weight => (weight / weightSum) * remainingUnits);
+    const extraUnits = rawUnits.map(value => Math.floor(value));
+    let unallocated = remainingUnits - extraUnits.reduce((sum, value) => sum + value, 0);
+    const remainders = rawUnits
+      .map((value, idx) => ({ idx, remainder: value - Math.floor(value) }))
+      .sort((a, b) => (b.remainder - a.remainder) || (a.idx - b.idx));
+
+    let pointer = 0;
+    while (unallocated > 0 && remainders.length > 0) {
+      const idx = remainders[pointer % remainders.length].idx;
+      extraUnits[idx] += 1;
+      unallocated -= 1;
+      pointer += 1;
+    }
+
+    for (let i = 0; i < keepCount; i++) {
+      units[i] += extraUnits[i];
+    }
+  }
+
+  return kept.map((item, idx) => ({
+    title: item.title,
+    estimatedHours: units[idx] / 2
+  }));
+}
+
+function isValidAISubtasks(subtasks, totalHours) {
+  const targetHours = Number(totalHours);
+  if (!Array.isArray(subtasks) || subtasks.length < 2) return false;
+  if (!Number.isFinite(targetHours) || targetHours <= 0) return false;
+
+  let aiTotal = 0;
+  for (const sub of subtasks) {
+    const title = String(sub?.title || '').trim();
+    const estimated = Number(sub?.estimatedHours);
+    if (!title) return false;
+    if (!Number.isFinite(estimated) || estimated <= 0) return false;
+    aiTotal += estimated;
+  }
+
+  const ratioDiff = Math.abs(aiTotal - targetHours) / targetHours;
+  return ratioDiff <= 0.4;
+}
+
+function normalizeAISubtasksByTaskType(task, subtasks, totalHours) {
+  const targetHours = getSplitTargetHours(task, totalHours);
+  if (!isValidAISubtasks(subtasks, targetHours)) {
+    return getTemplateSplit(task, targetHours);
+  }
+
+  const normalized = subtasks.map(sub => ({
+    title: String(sub.title || '').trim(),
+    estimatedHours: Number(sub.estimatedHours)
+  }));
+  const aiTotal = normalized.reduce((sum, sub) => sum + sub.estimatedHours, 0);
+  if (Math.abs(aiTotal - targetHours) <= 1e-6) return normalized;
+
+  const proportionalSubtasks = normalized.map(sub => ({
+    title: sub.title,
+    weight: sub.estimatedHours
+  }));
+  return allocateHoursByWeights(targetHours, proportionalSubtasks);
+}
 /** AI智能拆分，将任务拆分为多个子任务 */
 async function doAISplit(id) {
   const t = tasks.find(x => x.id === id);
@@ -1451,20 +2053,31 @@ async function doAISplit(id) {
   const originalText = btn.textContent;
   btn.textContent = 'AI拆分中...';
   btn.disabled = true;
+  const targetHours = getSplitTargetHours(
+    t,
+    parseFloat(document.getElementById('detailSplitHours')?.value)
+  );
   
   try {
-    const result = await parseTaskWithAI(t.title);
+    const profile = loadProfile();
+    const templateInfo = getTemplateForInput(t.title);
+    const result = await parseTaskWithAI(t.title, profile, templateInfo);
     if (result && result.subtasks && result.subtasks.length > 0) {
       const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
-      showSplitPreview(adjustedSubtasks);
-      toast('AI split completed, please review and apply', 'success');
+      const aiValid = isValidAISubtasks(adjustedSubtasks, targetHours);
+      const normalizedSubtasks = normalizeAISubtasksByTaskType(t, adjustedSubtasks, targetHours);
+      showSplitPreview(normalizedSubtasks);
+      toast(
+        aiValid ? 'AI split completed, please review and apply' : 'AI split quality is low, using template',
+        aiValid ? 'success' : 'info'
+      );
     } else {
-      showSplitPreview(getTemplateSplit(t));
+      showSplitPreview(getTemplateSplit(t, targetHours));
       toast('AI returned no split result, using template', 'info');
     }
   } catch (err) {
     console.error('AI 拆分失败:', err);
-    showSplitPreview(getTemplateSplit(t));
+    showSplitPreview(getTemplateSplit(t, targetHours));
     toast('AI split failed, using template', 'error');
   } finally {
     btn.textContent = originalText;
@@ -1473,20 +2086,10 @@ async function doAISplit(id) {
 }
 
 /** 获取模板拆分建议 */
-function getTemplateSplit(t) {
-  const total = parseFloat(document.getElementById('detailSplitHours')?.value) || totalHours(t) || 8;
-  const templates = {
-    paper: ['Literature review', 'Draft writing', 'Revision', 'Formatting'],
-    report: ['Collect materials', 'Outline', 'Write content', 'Review'],
-    study: ['Preview', 'Deep study', 'Practice', 'Summary'],
-    project: ['Requirement analysis', 'Solution design', 'Implementation', 'Testing']
-  };
-  let titles = ['Phase 1', 'Phase 2', 'Phase 3', 'Phase 4'];
-  for (const [k, v] of Object.entries(templates)) {
-    if (String(t.title || '').toLowerCase().includes(k)) { titles = v; break; }
-  }
-  const per = Math.round(total / titles.length * 10) / 10;
-  return titles.map(title => ({ title, estimatedHours: per }));
+function getTemplateSplit(t, totalHoursOverride = null) {
+  const taskType = detectTaskType(t?.title, TASK_TYPE_CONFIG);
+  const total = getSplitTargetHours(t, totalHoursOverride);
+  return allocateHoursByWeights(total, taskType.subtasks || []);
 }
 
 /** 显示拆分预览 */
@@ -1575,31 +2178,59 @@ function applyDetailSplit(id) {
 }
 
 // ======== Task CRUD ========
+/** 创建待办时若未选过使用目的，先弹出使用目的选择 */
 function openTaskModal(id = null) {
+  if (!id && !loadProfile().purpose) {
+    showPurposeModal(() => { closePurposeModal(); openTaskModal(null); });
+    return;
+  }
   const modal = document.getElementById('taskModal');
   const title = document.getElementById('taskModalTitle');
+  const fTitle = document.getElementById('fTitle');
   
   if (id) {
     const t = tasks.find(x => x.id === id);
     title.textContent = '编辑任务';
     document.getElementById('editId').value = id;
-    document.getElementById('fTitle').value = t.title;
+    fTitle.value = t.title;
     document.getElementById('fDeadline').value = t.deadline || '';
     document.getElementById('fImportance').value = t.importance || 3;
     document.getElementById('fUrgency').value = t.urgency || 3;
     document.getElementById('fNotes').value = t.notes || '';
+    // 编辑模式不显示示例
+    document.getElementById('titleExamples').style.display = 'none';
+    fTitle.placeholder = '输入任务标题';
   } else {
     title.textContent = '新建任务';
     document.getElementById('editId').value = '';
-    document.getElementById('fTitle').value = '';
+    fTitle.value = '';
     document.getElementById('fDeadline').value = fmtDate(new Date(Date.now() + 7 * 864e5));
     document.getElementById('fImportance').value = 3;
     document.getElementById('fUrgency').value = 3;
     document.getElementById('fNotes').value = '';
+    
+    // 轮换显示示例
+    const example = titleExamples[currentExampleIndex];
+    fTitle.placeholder = `例如：${example}`;
+    document.getElementById('titleExamples').textContent = `按 Tab 键填入：${example}`;
+    document.getElementById('titleExamples').style.display = 'block';
+    
+    // 更新索引，下次显示不同的示例
+    currentExampleIndex = (currentExampleIndex + 1) % titleExamples.length;
+    
+    // Tab 键填入示例
+    fTitle.onkeydown = (e) => {
+      if (e.key === 'Tab' && !fTitle.value) {
+        e.preventDefault();
+        fTitle.value = example;
+        document.getElementById('titleExamples').style.display = 'none';
+      }
+    };
   }
   
   updateSliderDisplay();
   modal.classList.add('open');
+  if (!id) fTitle.focus();
 }
 
 function closeTaskModal() {
@@ -1754,37 +2385,45 @@ function addSubtask(tid) {
 async function openSplitModal(id) {
   splitTargetId = id;
   const t = tasks.find(x => x.id === id);
+  const splitTotalInput = document.getElementById('splitTotalHours');
+  const initialTotal = getSplitTargetHours(t, totalHours(t) || 8);
+  if (splitTotalInput) splitTotalInput.value = initialTotal;
   
   const btn = document.getElementById('detailSplit');
   const originalText = btn ? btn.textContent : '加载中...';// 如果有按钮元素，显示加载状态
   if (btn) btn.textContent = 'AI拆分中...';
   
   try {
-    const result = await parseTaskWithAI(t.title);
+    const profile = loadProfile();
+    const templateInfo = getTemplateForInput(t.title);
+    const result = await parseTaskWithAI(t.title, profile, templateInfo);
+    const targetHours = getSplitTargetHours(t, parseFloat(splitTotalInput?.value));
     if (result && result.subtasks && result.subtasks.length > 0) {
       const adjustedSubtasks = adjustSubtasksForEstimate(result.subtasks);
+      const aiValid = isValidAISubtasks(adjustedSubtasks, targetHours);
+      const normalizedSubtasks = normalizeAISubtasksByTaskType(t, adjustedSubtasks, targetHours);
       const splitItems = document.getElementById('splitItems');
-      splitItems.innerHTML = adjustedSubtasks.map((sub, i) => `
+      splitItems.innerHTML = normalizedSubtasks.map((sub, i) => `
         <div class="split-item">
           <input type="text" value="${esc(sub.title)}" class="split-title-input">
           <input type="number" value="${sub.estimatedHours || 2}" min="0.5" step="0.5" class="split-hours-input">
           <span class="split-rm" onclick="this.parentElement.remove()">&#10005;</span>
         </div>
       `).join('');
-      const totalH = adjustedSubtasks.reduce((sum, s) => sum + (s.estimatedHours || 2), 0);
-      document.getElementById('splitTotalHours').value = totalH;
+      if (splitTotalInput) splitTotalInput.value = targetHours;
       updateSplitTotal();
-      toast('AI split completed, please review and apply', 'success');
+      toast(
+        aiValid ? 'AI split completed, please review and apply' : 'AI split quality is low, using template',
+        aiValid ? 'success' : 'info'
+      );
     } else {
-      const hours = totalHours(t) || 8;
-      document.getElementById('splitTotalHours').value = hours;
+      if (splitTotalInput) splitTotalInput.value = targetHours;
       regenerateSplit();
       toast('AI returned no split result, using template', 'info');
     }
   } catch (err) {
     console.error('AI 拆分失败:', err);
-    const hours = totalHours(t) || 8;
-    document.getElementById('splitTotalHours').value = hours;
+    if (splitTotalInput) splitTotalInput.value = getSplitTargetHours(t, parseFloat(splitTotalInput?.value));
     regenerateSplit();
     toast('AI split failed, using template', 'error');
   } finally {
@@ -1802,7 +2441,7 @@ function closeSplit() {
 function regenerateSplit() {
   const total = parseFloat(document.getElementById('splitTotalHours').value) || 8;
   const t = tasks.find(x => x.id === splitTargetId);
-  const subs = getTemplateSplit(t);
+  const subs = getTemplateSplit(t, total);
   document.getElementById('splitItems').innerHTML = subs.map((sub, i) => `
     <div class="split-item">
       <input type="text" value="${sub.title}" class="split-title-input">
@@ -1865,15 +2504,8 @@ function autoAssign() {
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  const weeklySlots = getActiveWeeklyAvailabilitySlots();
   const usedByDate = getUsedHoursByDate(active);
-  const capacitySlots = buildCapacitySlots({
-    startDate: today,
-    maxDays: 30,
-    weeklySlots,
-    usedHoursByDate: usedByDate,
-    fallbackDailyHours: settings.dailyWorkHours || 4
-  });
+  const capacitySlots = buildAvailableSlots(settings, today, null, usedByDate, 30);
 
   if (!capacitySlots.length) {
     toast('No available slot for auto assignment', 'warning');
@@ -1913,13 +2545,17 @@ function autoAssign() {
     if (!task.assignedDays) task.assignedDays = {};
 
     const slotGroupState = new Map();
+    const slotTaskDateState = new Map([
+      [task.id, new Set(Object.keys(task.assignedDays || {}))]
+    ]);
     items.forEach(sub => {
       const placed = assignSubtaskToCapacitySlots(
         task,
         sub,
         capacitySlots,
         assignmentDeadline,
-        slotGroupState
+        slotGroupState,
+        slotTaskDateState
       );
       if (!placed) warns.add(task.title);
     });
@@ -2000,16 +2636,8 @@ function autoAssignSingleTask(task) {
   const assignmentDeadline = getAssignmentDeadline(task, today, {});
 
   const active = tasks.filter(t => t.status === 'active');
-  const weeklySlots = getActiveWeeklyAvailabilitySlots();
   const usedByDate = getUsedHoursByDate(active);
-  const capacitySlots = buildCapacitySlots({
-    startDate: today,
-    assignmentDeadline,
-    maxDays: 30,
-    weeklySlots,
-    usedHoursByDate: usedByDate,
-    fallbackDailyHours: settings.dailyWorkHours || 4
-  });
+  const capacitySlots = buildAvailableSlots(settings, today, assignmentDeadline, usedByDate, 30);
 
   if (!capacitySlots.length) {
     toast('No available slot for auto assignment', 'warning');
@@ -2019,6 +2647,9 @@ function autoAssignSingleTask(task) {
   if (!task.assignedDays) task.assignedDays = {};
 
   const slotGroupState = new Map();
+  const slotTaskDateState = new Map([
+    [task.id, new Set(Object.keys(task.assignedDays || {}))]
+  ]);
   let hasUnplaced = false;
   items.forEach(sub => {
     const placed = assignSubtaskToCapacitySlots(
@@ -2026,7 +2657,8 @@ function autoAssignSingleTask(task) {
       sub,
       capacitySlots,
       assignmentDeadline,
-      slotGroupState
+      slotGroupState,
+      slotTaskDateState
     );
     if (!placed) hasUnplaced = true;
   });
@@ -2045,7 +2677,9 @@ async function handleAI() {
   status.textContent = '解析中..';
   
   try {
-    const result = await parseTaskWithAI(text);
+    const profile = loadProfile();
+    const templateInfo = getTemplateForInput(text);
+    const result = await parseTaskWithAI(text, profile, templateInfo);
     status.textContent = '';
     const adjustedResult = {
       ...result,
@@ -2149,6 +2783,49 @@ function closeAIPreview() {
   document.getElementById('aiPreview').classList.remove('open');
 }
 
+// ======== 输入模板（三组写死模板 + 入口 UI） ========
+function toggleTemplatePopover() {
+  const pop = document.getElementById('templatePopover');
+  const btn = document.getElementById('templateBtn');
+  if (pop.classList.contains('open')) {
+    closeTemplatePopover();
+    return;
+  }
+  closeAIPreview();
+  renderTemplatePopover();
+  pop.classList.add('open');
+  btn.classList.add('active');
+}
+
+function closeTemplatePopover() {
+  document.getElementById('templatePopover').classList.remove('open');
+  document.getElementById('templateBtn').classList.remove('active');
+}
+
+function renderTemplatePopover() {
+  const inner = document.getElementById('templatePopoverInner');
+  inner.innerHTML = TASK_TEMPLATE_GROUPS.map((g, gi) => `
+    <div class="template-group">
+      <div class="template-group-name">${esc(g.name)}</div>
+      ${g.templates.map((t, ti) => `<button type="button" class="template-chip" data-g="${gi}" data-t="${ti}">${esc(t.label)}</button>`).join('')}
+    </div>
+  `).join('');
+  inner.querySelectorAll('.template-chip').forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      const gi = parseInt(btn.dataset.g, 10);
+      const ti = parseInt(btn.dataset.t, 10);
+      const group = TASK_TEMPLATE_GROUPS[gi];
+      const text = group?.templates?.[ti]?.text;
+      if (text) {
+        document.getElementById('aiInput').value = text;
+        document.getElementById('aiInput').focus();
+      }
+      closeTemplatePopover();
+    };
+  });
+}
+
 /** 从AI解析结果创建任务 */
 function createFromAI() {
   const el = document.getElementById('aiPreview');
@@ -2201,16 +2878,40 @@ function createFromAI() {
 }
 
 // ======== Settings ========
+function normalizeWeeklySlotRowsForEditor(slots = []) {
+  if (!Array.isArray(slots)) return [];
+  return slots.map(slot => {
+    let day = Number(slot?.weekday ?? slot?.dayOfWeek);
+    if (!Number.isInteger(day) || day < 0 || day > 6) day = 1;
+
+    let startMin = parseTimeToMinutes(String(slot?.start || ''));
+    if (startMin == null) startMin = 9 * 60;
+
+    let endMin = parseTimeToMinutes(String(slot?.end || ''));
+    if (endMin == null || endMin <= startMin) {
+      endMin = Math.min(startMin + 60, 24 * 60);
+      if (endMin <= startMin) startMin = Math.max(0, endMin - 60);
+    }
+
+    return {
+      weekday: day,
+      dayOfWeek: day,
+      start: minutesToTime(startMin),
+      end: minutesToTime(endMin)
+    };
+  });
+}
+
 function renderWeeklySlotEditor(slots = []) {
   const container = document.getElementById('sWeeklySlots');
-  const normalized = normalizeWeeklyAvailabilitySlots(slots);
-  if (!normalized.length) {
+  const rows = normalizeWeeklySlotRowsForEditor(slots);
+  if (!rows.length) {
     container.innerHTML = '<div class="weekly-slots-empty">未设置每周可用时间，将按默认时间分配任务</div>';
     return;
   }
 
   const dayOptions = WEEKDAY_PICKER.map(day => `<option value="${day.value}">${day.label}</option>`).join('');
-  container.innerHTML = normalized.map(slot => `
+  container.innerHTML = rows.map(slot => `
     <div class="weekly-slot-item">
       <select class="slot-day">${dayOptions}</select>
       <input type="time" class="slot-start" value="${slot.start}" step="900">
@@ -2222,13 +2923,14 @@ function renderWeeklySlotEditor(slots = []) {
 
   container.querySelectorAll('.weekly-slot-item').forEach((row, idx) => {
     const select = row.querySelector('.slot-day');
-    select.value = String(normalized[idx].dayOfWeek);
+    select.value = String(rows[idx].dayOfWeek);
   });
 }
 
 function collectWeeklySlotEditorRows() {
   const rows = Array.from(document.querySelectorAll('#sWeeklySlots .weekly-slot-item'));
   return rows.map(row => ({
+    weekday: Number(row.querySelector('.slot-day')?.value),
     dayOfWeek: Number(row.querySelector('.slot-day')?.value),
     start: String(row.querySelector('.slot-start')?.value || ''),
     end: String(row.querySelector('.slot-end')?.value || '')
@@ -2249,16 +2951,34 @@ function validateAndNormalizeWeeklySlotsFromEditor() {
 
 function addWeeklySlotRow() {
   const slots = collectWeeklySlotEditorRows();
-  slots.push({ dayOfWeek: 1, start: '09:00', end: '10:00' });
+  const last = slots[slots.length - 1];
+  const baseDay = Number(last?.weekday ?? last?.dayOfWeek);
+  const nextDay = Number.isInteger(baseDay) && baseDay >= 0 && baseDay <= 6
+    ? (baseDay + 2) % 7
+    : 1;
+  slots.push({
+    weekday: nextDay,
+    dayOfWeek: nextDay,
+    start: String(last?.start || '09:00'),
+    end: String(last?.end || '10:00')
+  });
   renderWeeklySlotEditor(slots);
 }
 
 function openSettings() {
-  settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+  syncWeeklyAvailabilitySettingsObject(settings);
   document.getElementById('sDailyH').value = settings.dailyWorkHours;
   document.getElementById('sSplitT').value = settings.splitThreshold;
   document.getElementById('sAutoAssign').value = String(settings.autoAssignAfterSplit);
-  renderWeeklySlotEditor(settings.weeklyAvailabilitySlots);
+
+  renderWeeklySlotEditor(settings.weeklyAvailability);
+  const profile = loadProfile();
+  const tagsEl = document.getElementById('settingsProfileTags');
+  if (tagsEl) {
+    tagsEl.innerHTML = profile.tags && profile.tags.length
+      ? profile.tags.map(t => `<span>${esc(t)}</span>`).join('')
+      : '暂无';
+  }
   document.getElementById('settingsModal').classList.add('open');
 }
 
@@ -2276,7 +2996,17 @@ function saveSettingsHandler() {
     toast('Please check weekly availability: end time must be after start time', 'error');
     return;
   }
-  settings.weeklyAvailabilitySlots = weeklySlots;
+  settings.weeklyAvailability = weeklySlots.map(slot => ({
+    weekday: slot.weekday,
+    start: slot.start,
+    end: slot.end
+  }));
+  settings.weeklyAvailabilitySlots = weeklySlots.map(slot => ({
+    dayOfWeek: slot.dayOfWeek,
+    start: slot.start,
+    end: slot.end
+  }));
+  syncWeeklyAvailabilitySettingsObject(settings);
 
   saveSettings(settings);
   closeSettingsModal();
@@ -2293,7 +3023,7 @@ function toggleFilter() {
 
 // ======== Export/Import ========
 function exportData() {
-  const blob = new Blob([JSON.stringify({ tasks, settings, exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify({ tasks, settings, profile: loadProfile(), exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'bugule-backup-' + fmtDate(new Date()) + '.json';
@@ -2312,7 +3042,8 @@ function importData(e) {
         showConfirm('Import data', 'This will overwrite current data. Continue?', () => {
           tasks = data.tasks;
           if (data.settings) settings = { ...settings, ...data.settings };
-          settings.weeklyAvailabilitySlots = normalizeWeeklyAvailabilitySlots(settings.weeklyAvailabilitySlots || []);
+          syncWeeklyAvailabilitySettingsObject(settings);
+          if (data.profile && typeof data.profile === 'object') saveProfile(data.profile);
           saveTasks(tasks);
           saveSettings(settings);
           migrateTasks();
@@ -2379,11 +3110,286 @@ function handleSortChange(e) {
   renderSidebar();
 }
 
+// ======== 用户画像引导 ========
+// 注册后仅：身份角色、时间管理挑战；使用目的在创建待办时再选
+const ONBOARDING_STEPS = [
+  { key: 'role', title: '你的身份', desc: '选择最符合你的身份角色，AI 将据此为你定制任务拆分建议。' },
+  { key: 'challenge', title: '时间管理挑战', desc: '你目前最大的时间管理困扰是？（可选，帮助 AI 给出更贴合的拆分与建议）' }
+];
+
+let onboardingStepIndex = 0;
+let onboardingDraft = { role: '', purpose: '', challenge: '' };
+
+function setupOnboarding() {
+  document.getElementById('onboardingPrev').onclick = () => { onboardingStepIndex--; renderOnboardingStep(); };
+  document.getElementById('onboardingNext').onclick = () => { onboardingStepIndex++; renderOnboardingStep(); };
+  document.getElementById('onboardingDone').onclick = finishOnboarding;
+  document.getElementById('editProfileBtn').onclick = () => { openOnboardingForEdit(); };
+  // 使用目的弹窗（创建待办时弹出）
+  document.getElementById('purposeModalClose').onclick = closePurposeModal;
+  document.getElementById('purposeModalSkip').onclick = () => { closePurposeModal(); };
+  document.getElementById('purposeModalOk').onclick = confirmPurposeSelection;
+}
+
+let purposeModalCallback = null;
+let selectedPurposeValue = '';
+
+function showPurposeModal(onConfirm) {
+  purposeModalCallback = onConfirm;
+  selectedPurposeValue = loadProfile().purpose || '';
+  const opts = USER_PROFILE_OPTIONS.purpose;
+  const container = document.getElementById('purposeModalOptions');
+  container.innerHTML = opts.map(o => {
+    const selected = selectedPurposeValue === o.value ? ' selected' : '';
+    return `<button type="button" class="onboarding-opt${selected}" data-value="${esc(o.value)}">${esc(o.label)}</button>`;
+  }).join('');
+  container.querySelectorAll('.onboarding-opt').forEach(btn => {
+    btn.onclick = () => {
+      selectedPurposeValue = btn.dataset.value;
+      container.querySelectorAll('.onboarding-opt').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    };
+  });
+  document.getElementById('purposeModal').classList.add('open');
+}
+
+function closePurposeModal() {
+  document.getElementById('purposeModal').classList.remove('open');
+  purposeModalCallback = null;
+}
+
+function confirmPurposeSelection() {
+  if (!selectedPurposeValue) {
+    toast('请先选择使用目的', 'warning');
+    return;
+  }
+  saveProfile({ ...loadProfile(), purpose: selectedPurposeValue });
+  closePurposeModal();
+  if (purposeModalCallback) purposeModalCallback();
+  purposeModalCallback = null;
+  toast('已记录使用目的');
+}
+
+function openOnboardingForEdit() {
+  const profile = loadProfile();
+  onboardingDraft = { role: profile.role || '', purpose: profile.purpose || '', challenge: profile.challenge || '' };
+  onboardingStepIndex = 0;
+  renderOnboardingStep();
+  document.getElementById('settingsModal').classList.remove('open');
+  showOnboarding();
+}
+
+function showOnboarding() {
+  const profile = loadProfile();
+  onboardingDraft = { role: profile.role || '', purpose: profile.purpose || '', challenge: profile.challenge || '' };
+  onboardingStepIndex = 0;
+  renderOnboardingStep();
+  document.getElementById('onboardingModal').classList.add('open');
+}
+
+function closeOnboarding() {
+  document.getElementById('onboardingModal').classList.remove('open');
+}
+
+function renderOnboardingStep() {
+  const step = ONBOARDING_STEPS[onboardingStepIndex];
+  const opts = USER_PROFILE_OPTIONS[step.key];
+  document.getElementById('onboardingTitle').textContent = step.title;
+  document.getElementById('onboardingStep').textContent = `${onboardingStepIndex + 1}/${ONBOARDING_STEPS.length}`;
+  document.getElementById('onboardingDesc').textContent = step.desc;
+  const container = document.getElementById('onboardingOptions');
+  container.innerHTML = opts.map(o => {
+    const selected = onboardingDraft[step.key] === o.value ? ' selected' : '';
+    return `<button type="button" class="onboarding-opt${selected}" data-value="${esc(o.value)}">${esc(o.label)}</button>`;
+  }).join('');
+  container.querySelectorAll('.onboarding-opt').forEach(btn => {
+    btn.onclick = () => {
+      onboardingDraft[step.key] = btn.dataset.value;
+      container.querySelectorAll('.onboarding-opt').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    };
+  });
+  document.getElementById('onboardingPrev').style.visibility = onboardingStepIndex === 0 ? 'hidden' : 'visible';
+  const isLast = onboardingStepIndex === ONBOARDING_STEPS.length - 1;
+  document.getElementById('onboardingNext').style.display = isLast ? 'none' : 'inline-block';
+  document.getElementById('onboardingDone').style.display = isLast ? 'inline-block' : 'none';
+}
+
+function finishOnboarding() {
+  const profile = loadProfile();
+  saveProfile({ role: onboardingDraft.role, challenge: onboardingDraft.challenge, purpose: profile.purpose || '', completed: true });
+  closeOnboarding();
+  toast('画像已保存，AI 拆分将更贴合你的类型');
+
+// ======== Pomodoro Timer ========
+let pomodoroTimer = null;
+let pomodoroTimeLeft = 0;
+let pomodoroTotalTime = 0;
+let pomodoroTaskId = null;
+let pomodoroSubtaskId = null;
+
+function openPomodoroTimer(taskId, subtaskId) {
+  pomodoroTaskId = taskId;
+  pomodoroSubtaskId = subtaskId;
+  
+  const task = tasks.find(t => t.id === taskId);
+  const subtask = task?.subtasks?.find(s => s.id === subtaskId);
+  
+  // 更新任务选择下拉框
+  const select = document.getElementById('tomatoTaskSelect');
+  select.innerHTML = `<option value="${taskId}|${subtaskId}">${subtask ? subtask.title : task?.title}</option>`;
+  select.value = `${taskId}|${subtaskId}`;
+  
+  // 重置计时器显示
+  resetPomodoroDisplay();
+  
+  document.getElementById('tomatoModal').classList.add('open');
+}
+
+function resetPomodoroDisplay() {
+  const duration = parseInt(document.getElementById('tomatoDuration').value) || 25;
+  pomodoroTimeLeft = duration * 60;
+  pomodoroTotalTime = pomodoroTimeLeft;
+  updatePomodoroDisplay();
+  document.getElementById('tomatoStatus').textContent = '准备开始';
+  document.getElementById('tomatoBar').style.width = '0%';
+  document.getElementById('tomatoStart').style.display = 'inline-block';
+  document.getElementById('tomatoPause').style.display = 'none';
+  document.getElementById('tomatoComplete').style.display = 'none';
+}
+
+function updatePomodoroDisplay() {
+  const mins = Math.floor(pomodoroTimeLeft / 60).toString().padStart(2, '0');
+  const secs = (pomodoroTimeLeft % 60).toString().padStart(2, '0');
+  document.getElementById('tomatoTime').textContent = `${mins}:${secs}`;
+  
+  const progress = ((pomodoroTotalTime - pomodoroTimeLeft) / pomodoroTotalTime) * 100;
+  document.getElementById('tomatoBar').style.width = `${progress}%`;
+}
+
+function startPomodoro() {
+  if (pomodoroTimeLeft <= 0) resetPomodoroDisplay();
+  
+  document.getElementById('tomatoStatus').textContent = '专注中...';
+  document.getElementById('tomatoStart').style.display = 'none';
+  document.getElementById('tomatoPause').style.display = 'inline-block';
+  document.getElementById('tomatoComplete').style.display = 'none';
+  
+  pomodoroTimer = setInterval(() => {
+    pomodoroTimeLeft--;
+    updatePomodoroDisplay();
+    
+    if (pomodoroTimeLeft <= 0) {
+      completePomodoro();
+    }
+  }, 1000);
+}
+
+function pausePomodoro() {
+  clearInterval(pomodoroTimer);
+  document.getElementById('tomatoStatus').textContent = '已暂停';
+  document.getElementById('tomatoStart').style.display = 'inline-block';
+  document.getElementById('tomatoPause').style.display = 'none';
+}
+
+function stopPomodoro() {
+  clearInterval(pomodoroTimer);
+  resetPomodoroDisplay();
+}
+
+function completePomodoro() {
+  clearInterval(pomodoroTimer);
+  document.getElementById('tomatoStatus').textContent = '专注完成！';
+  document.getElementById('tomatoStart').style.display = 'none';
+  document.getElementById('tomatoPause').style.display = 'none';
+  document.getElementById('tomatoComplete').style.display = 'inline-block';
+  
+  // 记录实际耗时到子任务
+  if (pomodoroTaskId && pomodoroSubtaskId) {
+    const task = tasks.find(t => t.id === pomodoroTaskId);
+    const subtask = task?.subtasks?.find(s => s.id === pomodoroSubtaskId);
+    if (subtask) {
+      const actualMinutes = Math.round(pomodoroTotalTime / 60);
+      subtask.actualHours = (subtask.actualHours || 0) + (actualMinutes / 60);
+      saveTasks(tasks);
+      toast(`已记录 ${actualMinutes} 分钟专注时间`, 'success');
+    }
+  }
+}
+
+function closePomodoro() {
+  clearInterval(pomodoroTimer);
+  document.getElementById('tomatoModal').classList.remove('open');
+  pomodoroTaskId = null;
+  pomodoroSubtaskId = null;
+}
+
+// ======== Subtask Detail ========
+function showSubtaskDetail(taskId, subtaskId) {
+  const task = tasks.find(t => t.id === taskId);
+  const subtask = task?.subtasks?.find(s => s.id === subtaskId);
+  if (!subtask) return;
+  
+  // 填充详情面板
+  document.getElementById('detailTitleInput').value = subtask.title;
+  document.getElementById('detailBody').innerHTML = `
+    <div class="detail-section">
+      <label>所属任务</label>
+      <div class="detail-value">${esc(task.title)}</div>
+    </div>
+    <div class="detail-section">
+      <label>预计耗时</label>
+      <div class="detail-value">${formatDuration(subtask.estimatedHours)}</div>
+    </div>
+    <div class="detail-section">
+      <label>实际耗时</label>
+      <div class="detail-value">${formatDuration(subtask.actualHours || 0)}</div>
+    </div>
+    <div class="detail-section">
+      <label>完成状态</label>
+      <div class="detail-value">${subtask.completed ? '已完成' : '进行中'}</div>
+    </div>
+    <div class="detail-actions-row" style="margin-top:20px">
+      <button class="dbtn dbtn-primary" onclick="startPomodoroForSubtask('${taskId}', '${subtaskId}')">🍅 开始番茄钟</button>
+      <button class="dbtn ${subtask.completed ? '' : 'dbtn-success'}" onclick="toggleSubtaskComplete('${taskId}', '${subtaskId}')">${subtask.completed ? '标记未完成' : '✓ 标记完成'}</button>
+    </div>
+  `;
+  
+  document.getElementById('detailMask').classList.add('open');
+  document.getElementById('detailPanel').classList.add('open');
+  
+  // 绑定关闭事件
+  document.getElementById('detailClose').onclick = closeDetail;
+  document.getElementById('detailMask').onclick = closeDetail;
+}
+
+function startPomodoroForSubtask(taskId, subtaskId) {
+  closeDetail();
+  openPomodoroTimer(taskId, subtaskId);
+}
+
+function toggleSubtaskComplete(taskId, subtaskId) {
+  const task = tasks.find(t => t.id === taskId);
+  const subtask = task?.subtasks?.find(s => s.id === subtaskId);
+  if (subtask) {
+    subtask.completed = !subtask.completed;
+    saveTasks(tasks);
+    renderAll();
+    closeDetail();
+    toast(subtask.completed ? '子任务已完成' : '子任务已恢复', 'success');
+  }
+}
+
+function completeSubtask(taskId, subtaskId) {
+  toggleSubtaskComplete(taskId, subtaskId);
+}
+
 // ======== Event Listeners ========
 function setupListeners() {
   // View toggle
   document.getElementById('viewMonth').onclick = () => setView('month');
   document.getElementById('viewWeek').onclick = () => setView('week');
+  document.getElementById('viewToday').onclick = () => setView('today');
   
   // Navigation
   document.getElementById('navPrev').onclick = navPrev;
@@ -2402,7 +3408,7 @@ function setupListeners() {
     const input = e.currentTarget;
     if (e.key === 'Tab' && !e.shiftKey && !input.value.trim()) {
       e.preventDefault();
-      input.value = '已完成任务';
+      input.value = '\u5B8C\u6210\u8BFE\u7A0B\u8BBA\u6587';
       input.setSelectionRange(input.value.length, input.value.length);
     }
   });
@@ -2441,6 +3447,13 @@ function setupListeners() {
   // AI
   document.getElementById('aiSendBtn').onclick = handleAI;
   document.getElementById('aiInput').onkeydown = e => { if (e.key === 'Enter') handleAI(); };
+  // 模板入口
+  document.getElementById('templateBtn').onclick = e => {
+    e.stopPropagation();
+    toggleTemplatePopover();
+  };
+  document.addEventListener('click', () => closeTemplatePopover());
+  document.getElementById('templatePopover')?.addEventListener('click', e => e.stopPropagation());
   
   // Export/Import
   document.getElementById('exportBtn').onclick = exportData;
@@ -2451,6 +3464,51 @@ function setupListeners() {
   document.getElementById('confirmModalClose').onclick = closeConfirm;
   document.getElementById('confirmModalCancel').onclick = closeConfirm;
   
+  // Tomato Timer
+  document.getElementById('tomatoModalClose').onclick = closePomodoro;
+  document.getElementById('tomatoStart').onclick = startPomodoro;
+  document.getElementById('tomatoPause').onclick = pausePomodoro;
+  document.getElementById('tomatoStop').onclick = stopPomodoro;
+  document.getElementById('tomatoComplete').onclick = () => { closePomodoro(); toast('番茄钟完成！', 'success'); };
+  document.getElementById('tomatoDuration').onchange = resetPomodoroDisplay;
+  
+  // User Menu
+  const userAvatar = document.getElementById('userAvatar');
+  const userDropdown = document.getElementById('userDropdown');
+  
+  userAvatar.onclick = (e) => {
+    e.stopPropagation();
+    userDropdown.classList.toggle('open');
+  };
+  
+  document.addEventListener('click', (e) => {
+    if (!userDropdown.contains(e.target) && e.target !== userAvatar) {
+      userDropdown.classList.remove('open');
+    }
+  });
+  
+  document.querySelectorAll('.user-menu-item').forEach(item => {
+    item.onclick = () => {
+      const action = item.dataset.action;
+      userDropdown.classList.remove('open');
+      
+      switch(action) {
+        case 'profile':
+          toast('个人资料功能开发中...', 'info');
+          break;
+        case 'history':
+          toast('历史任务功能开发中...', 'info');
+          break;
+        case 'account':
+          toast('账号密码功能开发中...', 'info');
+          break;
+        case 'about':
+          toast('不咕了 v2.1 - 让DDL成为第一生产力', 'success');
+          break;
+      }
+    };
+  });
+  
   // Sliders
   document.getElementById('fImportance').oninput = updateSliderDisplay;
   document.getElementById('fUrgency').oninput = updateSliderDisplay;
@@ -2460,7 +3518,7 @@ function setupListeners() {
     if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); document.getElementById('aiInput').focus(); }
     if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); openTaskModal(); }
     if (e.key === 'Escape') {
-      closeTaskModal(); closeSplit(); closeSettingsModal(); closeConfirm(); closeAIPreview(); closeDetail();
+      closeTaskModal(); closeSplit(); closeSettingsModal(); closeConfirm(); closeAIPreview(); closeDetail(); closeOnboarding(); closePurposeModal(); closeTemplatePopover(); closeDayDetail();
     }
   };
   
@@ -2478,6 +3536,23 @@ function setupListeners() {
       renderSidebar();
       renderPanel();
     }
+  };
+}
+
+function registerQAHooks() {
+  if (window.__TT_QA__ !== true) return;
+
+  window.__TT_QA_openLegacySplitModal = async function(taskId) {
+    return openSplitModal(taskId);
+  };
+
+  window.__TT_QA_regenerateLegacySplit = function(totalHours) {
+    const input = document.getElementById('splitTotalHours');
+    const value = Number(totalHours);
+    if (input && Number.isFinite(value) && value > 0) {
+      input.value = value;
+    }
+    regenerateSplit();
   };
 }
 
