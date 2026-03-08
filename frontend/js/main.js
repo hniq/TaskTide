@@ -367,6 +367,23 @@ let confirmCb = null;
 let confirmCb2 = null;  // 2026.03.05 17:13 - 新增二次确认回调
 let sortMode = 'deadline'; // 'deadline' | 'priority' | 'manual'
 
+// ======== Task Title Examples ========
+const titleExamples = [
+  '完成课程论文',
+  '准备下周 presentation',
+  '整理项目文档',
+  '学习 React Hooks',
+  '完成健身计划',
+  '阅读技术书籍 30 分钟',
+  '复习考试重点',
+  '整理桌面文件',
+  '写周报',
+  '预约牙医检查',
+  '购买生活用品',
+  '规划周末行程'
+];
+let currentExampleIndex = 0;
+
 // ======== Drag State ========
 let draggedTaskId = null;
 let draggedSubtaskId = null;
@@ -614,13 +631,13 @@ function setView(v) {
 
 function navPrev() {
   if (currentView === 'month') { viewDate.setMonth(viewDate.getMonth() - 1); }
-  else { viewDate.setDate(viewDate.getDate() - 7); }
+  else if (currentView === 'week') { viewDate.setDate(viewDate.getDate() - 7); }
   renderMainView(); updateNavTitle();
 }
 
 function navNext() {
   if (currentView === 'month') { viewDate.setMonth(viewDate.getMonth() + 1); }
-  else { viewDate.setDate(viewDate.getDate() + 7); }
+  else if (currentView === 'week') { viewDate.setDate(viewDate.getDate() + 7); }
   renderMainView(); updateNavTitle();
 }
 
@@ -629,16 +646,21 @@ function navToday() { viewDate = new Date(); renderMainView(); updateNavTitle();
 function updateNavTitle() {
   const el = document.getElementById('navTitle');
   if (currentView === 'month') { el.textContent = viewDate.getFullYear() + '年' + (viewDate.getMonth() + 1) + '月'; }
-  else {
+  else if (currentView === 'week') {
     const start = getWeekStart(viewDate);
     const end = new Date(start); end.setDate(end.getDate() + 6);
     el.textContent = (start.getMonth() + 1) + '/' + start.getDate() + ' - ' + (end.getMonth() + 1) + '/' + end.getDate();
+  }
+  else if (currentView === 'today') {
+    const today = new Date();
+    el.textContent = today.getFullYear() + '年' + (today.getMonth() + 1) + '月' + today.getDate() + '日 · 今日专注';
   }
 }
 
 function renderMainView() {
   if (currentView === 'month') renderMonth();
-  else renderWeek();
+  else if (currentView === 'week') renderWeek();
+  else if (currentView === 'today') renderToday();
 }
 
 /** 构建日期映射 */
@@ -695,7 +717,7 @@ function renderMonth() {
       <div class="cal-date"><span class="cal-date-num${isToday ? ' is-today' : ''}">${d}</span><span class="cal-hours${over ? ' over' : ''}">${hrs > 0 ? hrs + 'h' : ''}</span></div>
       <div class="cal-tasks-mini">${list.slice(0, 3).map(x => {
         const isCompleted = x.sub.completed ? ' completed' : '';
-        return `<div class="cal-task-mini${isCompleted}" draggable="true" data-tid="${x.task.id}" data-sid="${x.sub.id}">
+        return `<div class="cal-task-mini${isCompleted}" draggable="true" data-tid="${x.task.id}" data-sid="${x.sub.id}" onclick="showSubtaskDetail('${x.task.id}', '${x.sub.id}')">
           <span class="cal-task-title">${esc(x.sub.title)}</span>
         </div>`;
       }).join('')}${list.length > 3 ? `<div class="cal-task-mini" style="color:var(--text-4)">+${list.length - 3} more</div>` : ''}</div>
@@ -751,10 +773,10 @@ function renderWeek() {
       <div class="week-col-body" data-date="${ds}">
         ${list.length ? list.map(x => {
           const isCompleted = x.sub.completed ? ' completed' : '';
-          return `<div class="week-task ${getQClass(x.task.eisenhowerQuadrant)}${isCompleted}" draggable="true" data-sid="${x.sub.id}" data-tid="${x.task.id}">
+          return `<div class="week-task ${getQClass(x.task.eisenhowerQuadrant)}${isCompleted}" draggable="true" data-sid="${x.sub.id}" data-tid="${x.task.id}" onclick="showSubtaskDetail('${x.task.id}', '${x.sub.id}')">
           <div class="week-task-title">${esc(x.sub.title)}</div>
           <div class="week-task-parent">${esc(x.task.title)}</div>
-          <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}">&#10005;</span></div>
+          <div class="week-task-hours">${formatDuration(x.sub.estimatedHours)} <span class="week-task-rm" data-sid="${x.sub.id}" data-tid="${x.task.id}" data-date="${ds}" onclick="event.stopPropagation();removeFromCalendar('${x.task.id}', '${x.sub.id}', '${ds}')">&#10005;</span></div>
         </div>`;
         }).join('') : '<div class="week-empty">暂无任务</div>'}
       </div>
@@ -769,6 +791,151 @@ function renderWeek() {
   bindWeekTaskDrag();
 }
 
+
+/** 渲染今日专注视图 */
+function renderToday() {
+  const body = document.getElementById('mainBody');
+  const todayStr = fmtDate(new Date());
+  const active = tasks.filter(t => t.status === 'active');
+  
+  // 收集今日所有子任务
+  let todaySubs = [];
+  active.forEach(t => {
+    if (!t.subtasks) return;
+    t.subtasks.forEach((sub, idx) => {
+      if (sub.completed) return;
+      // 检查是否已分配到今日
+      const isAssignedToday = t.assignedDays && t.assignedDays[todayStr];
+      todaySubs.push({
+        task: t,
+        sub: sub,
+        priority: calcPriority(t),
+        isAssigned: !!isAssignedToday,
+        order: idx
+      });
+    });
+  });
+  
+  // 按优先级排序，取前三
+  todaySubs.sort((a, b) => b.priority - a.priority);
+  const top3 = todaySubs.slice(0, 3);
+  
+  // 为每个子任务生成最小可开始版本
+  const miniStartActions = [
+    { keyword: ['写', '论文', '报告', '文档'], action: '打开文档写3行大纲' },
+    { keyword: ['读', '书', '文章', '资料'], action: '读第一页并标记3个重点' },
+    { keyword: ['学', '课程', '教程'], action: '观看5分钟入门视频' },
+    { keyword: ['整理', '清理', '收拾'], action: '花5分钟整理最显眼的一个区域' },
+    { keyword: ['准备', '计划', '规划'], action: '列出3个必须完成的关键点' },
+    { keyword: ['设计', '画图', '原型'], action: '在纸上画一个草图框架' },
+    { keyword: ['代码', '开发', '编程'], action: '创建一个文件并写5行伪代码' },
+    { keyword: ['测试', '调试', '修复'], action: '运行一次并记录第一个错误' },
+    { keyword: ['会议', '讨论', '沟通'], action: '列出3个要讨论的核心问题' },
+    { keyword: ['购买', '买', '采购'], action: '打开购物网站搜索第一个商品' }
+  ];
+  
+  function generateMiniStart(subtaskTitle) {
+    const title = subtaskTitle.toLowerCase();
+    for (const rule of miniStartActions) {
+      if (rule.keyword.some(k => title.includes(k))) {
+        return rule.action;
+      }
+    }
+    // 默认模板
+    const defaults = [
+      '花5分钟写下3个关键词',
+      '打开相关应用/文档看一眼',
+      '设置一个5分钟计时器开始',
+      '写下完成这个任务的第一步',
+      '收集一个相关的参考资料'
+    ];
+    return defaults[Math.floor(Math.random() * defaults.length)];
+  }
+  
+  let html = '<div class="today-view">';
+  
+  // 顶部欢迎语
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? '早上好' : hour < 18 ? '下午好' : '晚上好';
+  html += `<div class="today-greeting">${greeting}，今天专注这三件事</div>`;
+  
+  // 前三任务 + 每个子任务的最小可开始版本
+  if (top3.length > 0) {
+    html += '<div class="today-top3">';
+    top3.forEach((item, i) => {
+      const qClass = getQClass(item.task.eisenhowerQuadrant);
+      const miniStart = generateMiniStart(item.sub.title);
+      html += `
+        <div class="today-task-card ${qClass}" data-tid="${item.task.id}" data-sid="${item.sub.id}">
+          <div class="today-task-rank">${i + 1}</div>
+          <div class="today-task-content">
+            <div class="today-task-title">${esc(item.sub.title)}</div>
+            <div class="today-task-parent">来自：${esc(item.task.title)}</div>
+            <div class="today-task-ministart">
+              <span class="ministart-label">🚀 最小开始：</span>
+              <span class="ministart-action">${miniStart}</span>
+            </div>
+            <div class="today-task-meta">
+              <span class="today-task-priority">优先级 ${item.priority.toFixed(1)}</span>
+              <span class="today-task-hours">${formatDuration(item.sub.estimatedHours || 1)}</span>
+              ${item.isAssigned ? '<span class="today-task-assigned">已排程</span>' : '<span class="today-task-unassigned">未排程</span>'}
+            </div>
+          </div>
+          <div class="today-task-actions">
+            <button class="today-btn-pomodoro" data-tid="${item.task.id}" data-sid="${item.sub.id}" title="开始番茄钟">🍅</button>
+            <button class="today-btn-done" data-tid="${item.task.id}" data-sid="${item.sub.id}" title="完成">✓</button>
+          </div>
+        </div>
+      `;
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="today-empty">今天没有待办子任务，去创建新任务吧！</div>';
+  }
+  
+  // 今日统计
+  const completedToday = todaySubs.filter(x => x.sub.completed).length;
+  html += `
+    <div class="today-stats">
+      <div class="today-stat">
+        <span class="today-stat-num">${top3.length}</span>
+        <span class="today-stat-label">待办子任务</span>
+      </div>
+      <div class="today-stat">
+        <span class="today-stat-num">${todaySubs.filter(x => x.isAssigned).length}</span>
+        <span class="today-stat-label">已排程</span>
+      </div>
+    </div>
+  `;
+  
+  html += '</div>';
+  body.innerHTML = html;
+  
+  // 绑定事件
+  document.querySelectorAll('.today-task-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const tid = card.dataset.tid;
+      const sid = card.dataset.sid;
+      showSubtaskDetail(tid, sid);
+    });
+  });
+  
+  document.querySelectorAll('.today-btn-pomodoro').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      openPomodoroTimer(btn.dataset.tid, btn.dataset.sid);
+    });
+  });
+  
+  document.querySelectorAll('.today-btn-done').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      completeSubtask(btn.dataset.tid, btn.dataset.sid);
+    });
+  });
+}
+
+/** 为日历视图绑定拖拽事件（月视图格子、周视图列） */
 /** 绑定日历拖拽事件 */
 function bindCalendarDragEvents() {
   // 绑定拖拽开始事件
@@ -1578,28 +1745,51 @@ function applyDetailSplit(id) {
 function openTaskModal(id = null) {
   const modal = document.getElementById('taskModal');
   const title = document.getElementById('taskModalTitle');
+  const fTitle = document.getElementById('fTitle');
   
   if (id) {
     const t = tasks.find(x => x.id === id);
     title.textContent = '编辑任务';
     document.getElementById('editId').value = id;
-    document.getElementById('fTitle').value = t.title;
+    fTitle.value = t.title;
     document.getElementById('fDeadline').value = t.deadline || '';
     document.getElementById('fImportance').value = t.importance || 3;
     document.getElementById('fUrgency').value = t.urgency || 3;
     document.getElementById('fNotes').value = t.notes || '';
+    // 编辑模式不显示示例
+    document.getElementById('titleExamples').style.display = 'none';
+    fTitle.placeholder = '输入任务标题';
   } else {
     title.textContent = '新建任务';
     document.getElementById('editId').value = '';
-    document.getElementById('fTitle').value = '';
+    fTitle.value = '';
     document.getElementById('fDeadline').value = fmtDate(new Date(Date.now() + 7 * 864e5));
     document.getElementById('fImportance').value = 3;
     document.getElementById('fUrgency').value = 3;
     document.getElementById('fNotes').value = '';
+    
+    // 轮换显示示例
+    const example = titleExamples[currentExampleIndex];
+    fTitle.placeholder = `例如：${example}`;
+    document.getElementById('titleExamples').textContent = `按 Tab 键填入：${example}`;
+    document.getElementById('titleExamples').style.display = 'block';
+    
+    // 更新索引，下次显示不同的示例
+    currentExampleIndex = (currentExampleIndex + 1) % titleExamples.length;
+    
+    // Tab 键填入示例
+    fTitle.onkeydown = (e) => {
+      if (e.key === 'Tab' && !fTitle.value) {
+        e.preventDefault();
+        fTitle.value = example;
+        document.getElementById('titleExamples').style.display = 'none';
+      }
+    };
   }
   
   updateSliderDisplay();
   modal.classList.add('open');
+  if (!id) fTitle.focus();
 }
 
 function closeTaskModal() {
@@ -2379,11 +2569,175 @@ function handleSortChange(e) {
   renderSidebar();
 }
 
+// ======== Pomodoro Timer ========
+let pomodoroTimer = null;
+let pomodoroTimeLeft = 0;
+let pomodoroTotalTime = 0;
+let pomodoroTaskId = null;
+let pomodoroSubtaskId = null;
+
+function openPomodoroTimer(taskId, subtaskId) {
+  pomodoroTaskId = taskId;
+  pomodoroSubtaskId = subtaskId;
+  
+  const task = tasks.find(t => t.id === taskId);
+  const subtask = task?.subtasks?.find(s => s.id === subtaskId);
+  
+  // 更新任务选择下拉框
+  const select = document.getElementById('tomatoTaskSelect');
+  select.innerHTML = `<option value="${taskId}|${subtaskId}">${subtask ? subtask.title : task?.title}</option>`;
+  select.value = `${taskId}|${subtaskId}`;
+  
+  // 重置计时器显示
+  resetPomodoroDisplay();
+  
+  document.getElementById('tomatoModal').classList.add('open');
+}
+
+function resetPomodoroDisplay() {
+  const duration = parseInt(document.getElementById('tomatoDuration').value) || 25;
+  pomodoroTimeLeft = duration * 60;
+  pomodoroTotalTime = pomodoroTimeLeft;
+  updatePomodoroDisplay();
+  document.getElementById('tomatoStatus').textContent = '准备开始';
+  document.getElementById('tomatoBar').style.width = '0%';
+  document.getElementById('tomatoStart').style.display = 'inline-block';
+  document.getElementById('tomatoPause').style.display = 'none';
+  document.getElementById('tomatoComplete').style.display = 'none';
+}
+
+function updatePomodoroDisplay() {
+  const mins = Math.floor(pomodoroTimeLeft / 60).toString().padStart(2, '0');
+  const secs = (pomodoroTimeLeft % 60).toString().padStart(2, '0');
+  document.getElementById('tomatoTime').textContent = `${mins}:${secs}`;
+  
+  const progress = ((pomodoroTotalTime - pomodoroTimeLeft) / pomodoroTotalTime) * 100;
+  document.getElementById('tomatoBar').style.width = `${progress}%`;
+}
+
+function startPomodoro() {
+  if (pomodoroTimeLeft <= 0) resetPomodoroDisplay();
+  
+  document.getElementById('tomatoStatus').textContent = '专注中...';
+  document.getElementById('tomatoStart').style.display = 'none';
+  document.getElementById('tomatoPause').style.display = 'inline-block';
+  document.getElementById('tomatoComplete').style.display = 'none';
+  
+  pomodoroTimer = setInterval(() => {
+    pomodoroTimeLeft--;
+    updatePomodoroDisplay();
+    
+    if (pomodoroTimeLeft <= 0) {
+      completePomodoro();
+    }
+  }, 1000);
+}
+
+function pausePomodoro() {
+  clearInterval(pomodoroTimer);
+  document.getElementById('tomatoStatus').textContent = '已暂停';
+  document.getElementById('tomatoStart').style.display = 'inline-block';
+  document.getElementById('tomatoPause').style.display = 'none';
+}
+
+function stopPomodoro() {
+  clearInterval(pomodoroTimer);
+  resetPomodoroDisplay();
+}
+
+function completePomodoro() {
+  clearInterval(pomodoroTimer);
+  document.getElementById('tomatoStatus').textContent = '专注完成！';
+  document.getElementById('tomatoStart').style.display = 'none';
+  document.getElementById('tomatoPause').style.display = 'none';
+  document.getElementById('tomatoComplete').style.display = 'inline-block';
+  
+  // 记录实际耗时到子任务
+  if (pomodoroTaskId && pomodoroSubtaskId) {
+    const task = tasks.find(t => t.id === pomodoroTaskId);
+    const subtask = task?.subtasks?.find(s => s.id === pomodoroSubtaskId);
+    if (subtask) {
+      const actualMinutes = Math.round(pomodoroTotalTime / 60);
+      subtask.actualHours = (subtask.actualHours || 0) + (actualMinutes / 60);
+      saveTasks(tasks);
+      toast(`已记录 ${actualMinutes} 分钟专注时间`, 'success');
+    }
+  }
+}
+
+function closePomodoro() {
+  clearInterval(pomodoroTimer);
+  document.getElementById('tomatoModal').classList.remove('open');
+  pomodoroTaskId = null;
+  pomodoroSubtaskId = null;
+}
+
+// ======== Subtask Detail ========
+function showSubtaskDetail(taskId, subtaskId) {
+  const task = tasks.find(t => t.id === taskId);
+  const subtask = task?.subtasks?.find(s => s.id === subtaskId);
+  if (!subtask) return;
+  
+  // 填充详情面板
+  document.getElementById('detailTitleInput').value = subtask.title;
+  document.getElementById('detailBody').innerHTML = `
+    <div class="detail-section">
+      <label>所属任务</label>
+      <div class="detail-value">${esc(task.title)}</div>
+    </div>
+    <div class="detail-section">
+      <label>预计耗时</label>
+      <div class="detail-value">${formatDuration(subtask.estimatedHours)}</div>
+    </div>
+    <div class="detail-section">
+      <label>实际耗时</label>
+      <div class="detail-value">${formatDuration(subtask.actualHours || 0)}</div>
+    </div>
+    <div class="detail-section">
+      <label>完成状态</label>
+      <div class="detail-value">${subtask.completed ? '已完成' : '进行中'}</div>
+    </div>
+    <div class="detail-actions-row" style="margin-top:20px">
+      <button class="dbtn dbtn-primary" onclick="startPomodoroForSubtask('${taskId}', '${subtaskId}')">🍅 开始番茄钟</button>
+      <button class="dbtn ${subtask.completed ? '' : 'dbtn-success'}" onclick="toggleSubtaskComplete('${taskId}', '${subtaskId}')">${subtask.completed ? '标记未完成' : '✓ 标记完成'}</button>
+    </div>
+  `;
+  
+  document.getElementById('detailMask').classList.add('open');
+  document.getElementById('detailPanel').classList.add('open');
+  
+  // 绑定关闭事件
+  document.getElementById('detailClose').onclick = closeDetail;
+  document.getElementById('detailMask').onclick = closeDetail;
+}
+
+function startPomodoroForSubtask(taskId, subtaskId) {
+  closeDetail();
+  openPomodoroTimer(taskId, subtaskId);
+}
+
+function toggleSubtaskComplete(taskId, subtaskId) {
+  const task = tasks.find(t => t.id === taskId);
+  const subtask = task?.subtasks?.find(s => s.id === subtaskId);
+  if (subtask) {
+    subtask.completed = !subtask.completed;
+    saveTasks(tasks);
+    renderAll();
+    closeDetail();
+    toast(subtask.completed ? '子任务已完成' : '子任务已恢复', 'success');
+  }
+}
+
+function completeSubtask(taskId, subtaskId) {
+  toggleSubtaskComplete(taskId, subtaskId);
+}
+
 // ======== Event Listeners ========
 function setupListeners() {
   // View toggle
   document.getElementById('viewMonth').onclick = () => setView('month');
   document.getElementById('viewWeek').onclick = () => setView('week');
+  document.getElementById('viewToday').onclick = () => setView('today');
   
   // Navigation
   document.getElementById('navPrev').onclick = navPrev;
@@ -2450,6 +2804,51 @@ function setupListeners() {
   // Confirm
   document.getElementById('confirmModalClose').onclick = closeConfirm;
   document.getElementById('confirmModalCancel').onclick = closeConfirm;
+  
+  // Tomato Timer
+  document.getElementById('tomatoModalClose').onclick = closePomodoro;
+  document.getElementById('tomatoStart').onclick = startPomodoro;
+  document.getElementById('tomatoPause').onclick = pausePomodoro;
+  document.getElementById('tomatoStop').onclick = stopPomodoro;
+  document.getElementById('tomatoComplete').onclick = () => { closePomodoro(); toast('番茄钟完成！', 'success'); };
+  document.getElementById('tomatoDuration').onchange = resetPomodoroDisplay;
+  
+  // User Menu
+  const userAvatar = document.getElementById('userAvatar');
+  const userDropdown = document.getElementById('userDropdown');
+  
+  userAvatar.onclick = (e) => {
+    e.stopPropagation();
+    userDropdown.classList.toggle('open');
+  };
+  
+  document.addEventListener('click', (e) => {
+    if (!userDropdown.contains(e.target) && e.target !== userAvatar) {
+      userDropdown.classList.remove('open');
+    }
+  });
+  
+  document.querySelectorAll('.user-menu-item').forEach(item => {
+    item.onclick = () => {
+      const action = item.dataset.action;
+      userDropdown.classList.remove('open');
+      
+      switch(action) {
+        case 'profile':
+          toast('个人资料功能开发中...', 'info');
+          break;
+        case 'history':
+          toast('历史任务功能开发中...', 'info');
+          break;
+        case 'account':
+          toast('账号密码功能开发中...', 'info');
+          break;
+        case 'about':
+          toast('不咕了 v2.1 - 让DDL成为第一生产力', 'success');
+          break;
+      }
+    };
+  });
   
   // Sliders
   document.getElementById('fImportance').oninput = updateSliderDisplay;
