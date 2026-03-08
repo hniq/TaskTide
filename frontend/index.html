@@ -167,6 +167,16 @@
         <div class="setting-row"><div class="setting-info"><div class="s-label">每日可用时长 (小时)</div></div><div class="setting-ctrl"><input type="number" id="sDailyH" min="1" max="16" step="0.5"></div></div>
         <div class="setting-row"><div class="setting-info"><div class="s-label">拆分阈值 (小时)</div><div class="s-desc">超过此时长自动建议拆分</div></div><div class="setting-ctrl"><input type="number" id="sSplitT" min="1" max="40"></div></div>
         <div class="setting-row"><div class="setting-info"><div class="s-label">拆分后自动分配</div></div><div class="setting-ctrl"><select id="sAutoAssign"><option value="true">开启</option><option value="false">关闭</option></select></div></div>
+        <div class="setting-row setting-row-col">
+          <div class="setting-info">
+            <div class="s-label">每周可用时段</div>
+            <div class="s-desc">自动分配仅使用这些时段；未设置时回退为每日可用时长</div>
+          </div>
+          <div class="setting-ctrl setting-ctrl-block">
+            <div class="weekly-slots" id="sWeeklySlots"></div>
+            <button class="dbtn" style="font-size:11px" id="sAddWeeklySlot">+ 添加时段</button>
+          </div>
+        </div>
       </div>
       <div class="settings-section">
         <h4>数据管理</h4>
